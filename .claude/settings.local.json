@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python diag_api_fields.py)",
+      "WebFetch(domain:www.usaspending.gov)",
+      "WebFetch(domain:api.usaspending.gov)",
+      "WebFetch(domain:files.usaspending.gov)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sI -H \"User-Agent: SAMgovArby research@example.com\" \"https://files.usaspending.gov/award_data_archive/\")",
+      "Bash(curl -sv -H \"User-Agent: SAMgovArby research@example.com\" \"https://files.usaspending.gov/award_data_archive/\")",
+      "Bash(gh repo:*)",
+      "Bash(pip --version)",
+      "Bash(ls -la datasets/*.csv)",
+      "Read(//c/Users/decla/Desktop/SAMgovArby/**)",
+      "Bash(wc -l datasets/*.csv)",
+      "Bash(rtk ls:*)",
+      "Bash(rtk pip:*)",
+      "Bash(rtk git:*)"
+    ]
+  }
+}

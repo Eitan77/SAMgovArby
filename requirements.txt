@@ -1,0 +1,8 @@
+requests>=2.31
+yfinance>=0.2.36
+alpaca-trade-api>=3.0.0
+python-dotenv>=1.0
+pytz>=2024.1
+schedule>=1.2
+rapidfuzz>=3.6
+polars>=0.20
