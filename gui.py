@@ -449,7 +449,11 @@ class ProcessManager:
     def _on_finished(self, name: str, code: int):
         lw = self._log_widgets.get(name)
         if lw:
-            lw.append(f"\n✓ Process finished (exit code {code})\n")
+            try:
+                lw.append(f"\n✓ Process finished (exit code {code})\n")
+            except RuntimeError:
+                # LogViewer has been deleted (window closed)
+                pass
         for cb in self._finished_callbacks.get(name, []):
             try:
                 cb(code)
@@ -1219,7 +1223,6 @@ class OptimizerTab(QWidget):
 
         self._mode = QComboBox()
         self._mode.addItems(["From Training CSV (offline)", "From Backtest Cache"])
-        self._mode.currentIndexChanged.connect(self._on_mode_change)
         sf.addRow("Mode:", self._mode)
 
         self._csv_path = QLineEdit()
