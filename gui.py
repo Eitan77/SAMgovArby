@@ -1076,7 +1076,8 @@ class BacktestTab(QWidget):
         self._load_results()
 
     def _load_results(self):
-        path = OUTPUT_FILES["backtest"]
+        # backtest.py writes to backtest_results_2023.csv (year-specific)
+        path = SCRIPTS_DIR / "backtest_results_2023.csv"
         headers, rows = _load_csv(path)
         stats = _summary_stats(rows)
 
@@ -1180,11 +1181,7 @@ class BacktestTab(QWidget):
         if self._trades_window and not self._trades_window.isVisible():
             self._trades_window = None
         if not self._trades_window:
-            year = self._year_combo.currentText()
-            if year:
-                results_file = SCRIPTS_DIR / f"backtest_results_{year}.csv"
-            else:
-                results_file = OUTPUT_FILES["backtest"]
+            results_file = SCRIPTS_DIR / "backtest_results_2023.csv"
             self._trades_window = TradesDialog(
                 results_file, "Individual Trades — Backtest Results"
             )
