@@ -275,8 +275,11 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
     stats = _compute_stats(traded, tp, sl)
     _print_report(stats, all_results, traded, start_date, end_date)
 
-    # Build funnel breakdown
+    # Build funnel breakdown and save to JSON for GUI
     breakdown = _build_funnel_breakdown(all_results, training_csv=None)
+    breakdown_file = os.path.join(os.path.dirname(__file__), "backtest_breakdown_2023.json")
+    with open(breakdown_file, "w") as f:
+        _json.dump(breakdown, f)
 
     # Restore original max_market_cap if it was overridden
     if old_max_market_cap is not None:
@@ -418,8 +421,11 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     stats = _compute_stats(traded, tp, sl)
     _print_report(stats, all_results, traded, start_date, end_date)
 
-    # Build funnel breakdown (with training CSV for Stage 2/3 estimates)
+    # Build funnel breakdown and save to JSON for GUI
     breakdown = _build_funnel_breakdown(all_results, training_csv=csv_path)
+    breakdown_file = os.path.join(os.path.dirname(__file__), "backtest_breakdown_2023.json")
+    with open(breakdown_file, "w") as f:
+        _json.dump(breakdown, f)
 
     return stats, breakdown, all_results
 
