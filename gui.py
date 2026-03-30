@@ -1331,7 +1331,7 @@ class OptimizerTab(QWidget):
         row1 = QHBoxLayout(); row1.setSpacing(6)
         def _pct(key, default=""):
             v = best.get(key, default)
-            try: return f"{float(v)*100:.0f}%"
+            try: return f"{float(v):.1%}"  # already decimal, format as percentage
             except Exception: return str(v)
         def _val(key, default=""):
             return best.get(key, default)
