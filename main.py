@@ -156,16 +156,28 @@ def run_pipeline():
             log.error(f"Trade execution error for {ticker}: {e}")
             signal["trade_placed"] = False
 
+        # Mark processed and persist atomically before moving on.
+        # Persisting after each trade (rather than batching at the end) ensures
+        # that a crash mid-run does not replay already-traded contracts.
         processed_awards.add(key)
+        _save_processed_awards(processed_awards)
         _log_signal(signal)
 
-    _save_processed_awards(processed_awards)
     log.info("=== Pipeline run complete ===\n")
 
 
 def _award_key(contract):
-    """Stable dedup key for a contract award."""
-    return f"{contract['awardee_name']}|{contract['award_amount']}|{contract.get('posted_date', '')}"
+    """Stable, collision-safe dedup key for a contract award.
+
+    Uses JSON serialisation so embedded pipes or special characters in the
+    awardee name cannot collide with the delimiter.
+    """
+    import json as _json
+    return _json.dumps([
+        contract["awardee_name"],
+        str(contract["award_amount"]),
+        contract.get("posted_date", "")[:10],
+    ], separators=(",", ":"))
 
 
 def _load_processed_awards():
@@ -179,11 +191,18 @@ def _load_processed_awards():
 
 
 def _save_processed_awards(seen: set):
+    """Write atomically: write to a temp file then rename to avoid partial writes."""
+    tmp = PROCESSED_AWARDS_FILE + ".tmp"
     try:
-        with open(PROCESSED_AWARDS_FILE, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(sorted(seen), f)
+        os.replace(tmp, PROCESSED_AWARDS_FILE)  # atomic on POSIX; best-effort on Windows
     except Exception as e:
         log.warning(f"Could not save processed awards ledger: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _log_signal(signal):

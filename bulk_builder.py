@@ -117,10 +117,14 @@ def build_dataset(start_date: str, end_date: str,
              f"{private} private/no match, {too_large} over cap")
 
     # Step 4: Filter awards to public companies only.
-    # NOTE: market_cap_current is today's cap — NOT the historical cap at award time.
-    # We keep all public companies here; historical cap filtering happens downstream
-    # in build_training_set.py which computes historical_market_cap_approx per award.
+    # IMPORTANT: market_cap_current is TODAY's cap — NOT the historical cap at award time.
+    # We apply a generous current-cap filter here only to exclude obvious mega-caps
+    # (e.g. Lockheed Martin at $100B). Fine-grained historical cap filtering happens
+    # downstream in build_training_set.py which computes historical_market_cap_approx
+    # per award date. Do NOT use the output of this step to backtest without running
+    # build_training_set.py first.
     filtered_awards = []
+    excluded_large = 0
     for award in awards:
         name = award["awardee_name"]
         info = ticker_cache.get(name, {})
@@ -130,11 +134,23 @@ def build_dataset(start_date: str, end_date: str,
         if not ticker:
             continue
 
+        # Apply a 10× buffer on max_cap to catch companies that were small-cap
+        # at award time but have grown since. Downstream historical filtering
+        # will enforce the real cap at the correct point in time.
+        cap_ceiling = max_cap * 10
+        if market_cap_current > 0 and market_cap_current > cap_ceiling:
+            excluded_large += 1
+            continue
+
         award["ticker"] = ticker
-        award["market_cap_current"] = market_cap_current  # snapshot only — use for identity, not historical filter
+        award["market_cap_current"] = market_cap_current  # snapshot — for identity only
         filtered_awards.append(award)
 
-    log.info(f"Filtered to {len(filtered_awards)} awards from public companies under ${max_cap/1e6:.0f}M cap")
+    log.info(
+        f"Kept {len(filtered_awards)} awards from public companies "
+        f"(excluded {excluded_large} clear mega-caps over ${cap_ceiling/1e6:.0f}M current cap). "
+        f"Historical cap filtering deferred to build_training_set.py."
+    )
 
     # Step 5: Save dataset
     start_clean = start_date.replace("-", "")

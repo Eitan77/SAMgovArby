@@ -47,6 +47,10 @@ import requests
 import yfinance as yf
 
 from config_logging import setup_logging, add_verbosity_flags
+from config import (
+    MIN_CONTRACT_VALUE, MAX_AWARD_AMOUNT, TOP_N_TO_REMOVE,
+    EDGAR_RATE_LIMIT, EDGAR_8K_ENRICHMENT_DAYS, EDGAR_USER_AGENT,
+)
 
 # ─── Logging (initialized in main, default for module-level usage) ─────────────
 
@@ -68,13 +72,10 @@ CP_STAGE1 = os.path.join(CHECKPOINT_DIR, "stage1_filter.json")
 CP_STAGE2 = os.path.join(CHECKPOINT_DIR, "stage2_tickers.json")
 CP_STAGE3 = os.path.join(CHECKPOINT_DIR, "stage3_enrich.json")
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ─── Local aliases (from config — single source of truth) ─────────────────────
 
-MIN_CONTRACT_VALUE      = 1_000_000        # $1M
-MAX_AWARD_AMOUNT        = 10_000_000_000   # $10B
-TOP_N_TO_REMOVE         = 20               # remove top-N companies by volume
-EDGAR_RATE_LIMIT_SEC    = 0.12             # ~8 req/sec (SEC limit is 10)
-EDGAR_8K_WINDOW_DAYS    = 30               # look for 8-K within 30 days post-contract
+EDGAR_RATE_LIMIT_SEC = EDGAR_RATE_LIMIT       # seconds between EDGAR requests
+EDGAR_8K_WINDOW_DAYS = EDGAR_8K_ENRICHMENT_DAYS  # enrichment look-ahead window
 
 IDIQ_INDICATORS = ["idiq", "indefinite delivery", "indefinite quantity"]
 SOLE_SOURCE_INDICATORS = [
@@ -85,7 +86,7 @@ SOLE_SOURCE_INDICATORS = [
 EDGAR_TICKERS_URL    = "https://www.sec.gov/files/company_tickers.json"
 EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 EDGAR_HEADERS = {
-    "User-Agent": "SAMgovArby research@example.com",
+    "User-Agent": EDGAR_USER_AGENT,
     "Accept": "application/json",
 }
 

@@ -22,20 +22,25 @@ def _confidence_meets_minimum(confidence: str, minimum: str) -> bool:
         return False
 
 
-def _days_signed(earlier_str: str, later_str: str) -> int | None:
+def _days_signed(earlier_str, later_str) -> int | None:
     """Return (later - earlier).days as a signed int.
 
     Positive → later_str is after earlier_str.
     Negative → later_str is before earlier_str.
-    None     → either date is missing or unparseable.
+    None     → either date is missing, None, or unparseable.
     """
-    if not earlier_str or not later_str or earlier_str == "None" or later_str == "None":
+    # Normalise: CSV DictReader may give "" or None; str(None) == "None" guard
+    if not earlier_str or not later_str:
+        return None
+    earlier_str = str(earlier_str).strip()
+    later_str = str(later_str).strip()
+    if earlier_str in ("None", "nan", "") or later_str in ("None", "nan", ""):
         return None
     try:
         d1 = datetime.strptime(earlier_str[:10], "%Y-%m-%d")
         d2 = datetime.strptime(later_str[:10], "%Y-%m-%d")
         return (d2 - d1).days
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
@@ -97,16 +102,26 @@ def apply_filters_bt_from_training(row):
     days_to_pr = _days_signed(award_date, first_pr)  # positive = PR after award
     extra["first_pr_date"] = first_pr
 
-    if has_pr_value in ("unknown", None, "", "None"):
+    # Normalise has_pr_value: CSV may contain None, "", "None", or "unknown"
+    has_pr_str = str(has_pr_value).strip() if has_pr_value is not None else ""
+    if has_pr_str in ("unknown", "None", "nan", ""):
         # Data was never collected — let scoring handle conservatively (0 pts)
         extra["has_press_release"] = None
     elif days_to_pr is not None and 0 <= days_to_pr <= MAX_PR_WINDOW_DAYS:
+        # PR confirmed within the window → information already public
         extra["has_press_release"] = True
+    elif days_to_pr is None:
+        # PR date is missing even though has_pr says something — treat as unknown
+        extra["has_press_release"] = None
     else:
         extra["has_press_release"] = False
 
-    # Pass agency win count through for scoring
-    extra["agency_prior_win_count"] = int(row.get("agency_prior_win_count", 0) or 0)
+    # Pass agency win count through for scoring (safe int conversion)
+    raw_wins = row.get("agency_prior_win_count", 0)
+    try:
+        extra["agency_prior_win_count"] = int(float(raw_wins)) if raw_wins not in (None, "", "None") else 0
+    except (ValueError, TypeError):
+        extra["agency_prior_win_count"] = 0
 
     return True, "Passed filters (training-data mode)", extra
 

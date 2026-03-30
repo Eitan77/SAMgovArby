@@ -6,9 +6,11 @@ Usage:
 """
 import argparse
 import csv
+import glob
 import json as _json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -28,7 +30,7 @@ from config import SCORE_THRESHOLD, TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_DAY
 
 log = logging.getLogger("backtest")
 
-RESULTS_FILE = os.path.join(os.path.dirname(__file__), "backtest_results.csv")
+RESULTS_FILE = os.path.join(os.path.dirname(__file__), "backtest_results.csv")  # Overridden by run_backtest with year-specific name
 RESULTS_DETAILED_FILE = os.path.join(os.path.dirname(__file__), "backtest_results_detailed.csv")
 RESULTS_FIELDS = [
     "award_date", "awardee_name", "agency", "award_amount", "naics",
@@ -41,6 +43,120 @@ RESULTS_FIELDS = [
     "tp_target", "sl_target", "return_t7", "peak_pnl_pct",
 ]
 
+MIN_CONTRACT_VALUE = 1_000_000
+MAX_AWARD_AMOUNT = 10_000_000_000
+
+
+def _build_funnel_breakdown(all_results, training_csv=None):
+    """Build a complete funnel breakdown from Stage 1 (raw CSV) through backtest.
+
+    Returns dict with counts at each filtering stage.
+    If Stage 1 data (FY2023 CSV) is not available, shows only backtest-stage breakdown.
+    """
+    breakdown = {
+        "stage1_total": 0,
+        "stage1_idiq": 0,
+        "stage1_top20": 0,
+        "stage1_value_range": 0,
+        "stage2_after_build": 0,
+        "stage3_ticker_failed": 0,
+        "stage3_after_enrich": 0,
+        "backtest_market_cap": 0,
+        "backtest_8k": 0,
+        "backtest_dilutive": 0,
+        "backtest_low_score": 0,
+        "backtest_no_ticker": 0,
+        "backtest_no_price": 0,
+        "backtest_duplicate": 0,
+        "traded": 0,
+    }
+
+    # Attempt to load Stage 1 counts from raw FY2023 CSV
+    try:
+        fy_files = glob.glob(os.path.join("datasets", "FY2023*Contracts*.zip"))
+        if not fy_files:
+            fy_files = glob.glob(os.path.join("datasets", "FY*Contracts*.csv"))
+
+        if fy_files:
+            csv_file = fy_files[0]
+            log.debug(f"Loading raw FY2023 for Stage 1 counts: {csv_file}")
+
+            # Use polars for speed
+            try:
+                df = pl.read_csv(csv_file, infer_schema_length=1000)
+            except:
+                # Try with encoding
+                df = pl.read_csv(csv_file, encoding="latin-1", infer_schema_length=1000)
+
+            total = len(df)
+            breakdown["stage1_total"] = total
+
+            # Count IDIQ
+            idiq_col = next((c for c in df.columns if "idiq" in c.lower()), None)
+            if idiq_col:
+                breakdown["stage1_idiq"] = df.filter(pl.col(idiq_col) == True).height
+
+            # Count top-20 awardees
+            awardee_col = next((c for c in df.columns if "awardee" in c.lower()), None)
+            if awardee_col:
+                top20 = df.group_by(awardee_col).agg(pl.count().alias("cnt")).sort("cnt", descending=True).head(20)
+                top20_names = set(top20.select(awardee_col).to_series())
+                breakdown["stage1_top20"] = df.filter(pl.col(awardee_col).is_in(top20_names)).height
+
+            # Count value range (outside $1M-$10B)
+            amount_col = next((c for c in df.columns if "amount" in c.lower()), None)
+            if amount_col:
+                outside_range = df.filter(
+                    (pl.col(amount_col) < MIN_CONTRACT_VALUE) | (pl.col(amount_col) > MAX_AWARD_AMOUNT)
+                ).height
+                breakdown["stage1_value_range"] = outside_range
+        else:
+            log.debug("No FY2023 CSV found in datasets/, skipping Stage 1 counts")
+    except Exception as e:
+        log.debug(f"Could not load Stage 1 counts: {e}")
+
+    # Stage 2/3 estimates from training CSV row count
+    if training_csv and os.path.exists(training_csv):
+        try:
+            with open(training_csv) as f:
+                training_rows = sum(1 for _ in f) - 1  # Exclude header
+            breakdown["stage3_after_enrich"] = training_rows
+
+            # Estimate Stage 2 (before enrichment) by assuming small loss
+            if breakdown["stage1_total"] > 0:
+                stage1_after_filters = breakdown["stage1_total"] - breakdown["stage1_idiq"] - breakdown["stage1_top20"] - breakdown["stage1_value_range"]
+                breakdown["stage2_after_build"] = stage1_after_filters
+                breakdown["stage3_ticker_failed"] = max(0, stage1_after_filters - training_rows)
+        except Exception as e:
+            log.debug(f"Could not load training CSV for Stage 2/3 counts: {e}")
+
+    # Count backtest filter removals from all_results
+    for result in all_results:
+        reason = result.get("filter_reason", "")
+        fr = result.get("filter_result", "")
+
+        if fr == "pass":
+            breakdown["traded"] += 1
+        elif fr == "low_score":
+            breakdown["backtest_low_score"] += 1
+        elif fr == "no_ticker":
+            breakdown["backtest_no_ticker"] += 1
+        elif fr == "no_price_data":
+            breakdown["backtest_no_price"] += 1
+        elif fr == "duplicate":
+            breakdown["backtest_duplicate"] += 1
+        elif fr == "fail":
+            # Parse failure reason to subcategorize
+            if re.search(r"market cap.*exceeds", reason, re.I):
+                breakdown["backtest_market_cap"] += 1
+            elif re.search(r"8-K filed", reason, re.I):
+                breakdown["backtest_8k"] += 1
+            elif re.search(r"dilutive", reason, re.I):
+                breakdown["backtest_dilutive"] += 1
+            # Other "fail" reasons (IDIQ, value range) are from training build
+
+    return breakdown
+
 
 def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
                  tp: float = TAKE_PROFIT_PCT, sl: float = STOP_LOSS_PCT,
@@ -48,22 +164,35 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
                  output_file: str = RESULTS_FILE, use_cache: bool = True,
                  watchlist_mode: bool = False,
                  dataset_file: str = None,
-                 training_csv: str = None):
+                 training_csv: str = None,
+                 max_market_cap: int = None):
     """Run a full backtest and write results CSV. Returns summary stats dict.
 
     If training_csv is provided, uses the pre-built training CSV with historical
     signals (8-K, press release, historical market cap) for accurate backtesting.
+    If max_market_cap is provided, overrides config.MAX_MARKET_CAP for this run.
     """
+    import config as config_module
 
+    # Override max_market_cap if provided
+    old_max_market_cap = None
+    if max_market_cap is not None:
+        old_max_market_cap = config_module.MAX_MARKET_CAP
+        config_module.MAX_MARKET_CAP = max_market_cap
+
+    mcap_str = f" | MaxMCap=${max_market_cap/1e9:.1f}B" if max_market_cap else ""
     log.info(f"Backtest: {start_date} -> {end_date} | "
-             f"TP={tp*100:.0f}% SL={sl*100:.0f}% Hold={hold}d Threshold={threshold}")
+             f"TP={tp*100:.0f}% SL={sl*100:.0f}% Hold={hold}d Threshold={threshold}{mcap_str}")
 
     # Training CSV mode: use historical data for all signals
     if training_csv:
-        return _run_backtest_from_training(
+        result = _run_backtest_from_training(
             training_csv, start_date, end_date, max_records,
-            tp, sl, hold, threshold, output_file
+            tp, sl, hold, threshold, output_file, max_market_cap
         )
+        if old_max_market_cap is not None:
+            config_module.MAX_MARKET_CAP = old_max_market_cap
+        return result
 
     all_results = []
     total_fetched = 0
@@ -146,7 +275,14 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
     stats = _compute_stats(traded, tp, sl)
     _print_report(stats, all_results, traded, start_date, end_date)
 
-    return stats, all_results
+    # Build funnel breakdown
+    breakdown = _build_funnel_breakdown(all_results, training_csv=None)
+
+    # Restore original max_market_cap if it was overridden
+    if old_max_market_cap is not None:
+        config_module.MAX_MARKET_CAP = old_max_market_cap
+
+    return stats, breakdown, all_results
 
 
 def _process_contract(contract, tp, sl, hold, threshold, ticker_cache=None):
@@ -168,17 +304,22 @@ def _process_contract(contract, tp, sl, hold, threshold, ticker_cache=None):
     if not passed:
         return base
 
-    # Score
+    # Score — use historical market cap when available
     market_cap = extra.get("market_cap", 0)
     if not market_cap and extra.get("ticker"):
         market_cap = get_historical_market_cap(
             extra["ticker"], contract.get("posted_date", ""))
         extra["market_cap"] = market_cap
 
+    # agency_prior_win_count is not available in non-training mode; 0 → first win
+    # but we don't have full history here so leave is_first_agency_win=None
+    # (scores 0 pts conservatively — consistent with live mode)
     score, breakdown = score_contract(contract, market_cap, threshold=threshold)
     base["score"] = score
     base["market_cap"] = round(market_cap)
     base["value_to_mcap_pct"] = breakdown.get("value_to_mcap", {}).get("ratio", 0)
+
+    log.info(f"Score {score}/100 | mcap=${market_cap:,.0f} | {contract['awardee_name'][:40]} | Pass={score >= threshold}")
 
     if score < threshold:
         base["filter_result"] = "low_score"
@@ -212,7 +353,7 @@ def _process_contract(contract, tp, sl, hold, threshold, ticker_cache=None):
 
 
 def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
-                                tp, sl, hold, threshold, output_file):
+                                tp, sl, hold, threshold, output_file, max_market_cap=None):
     """Run backtest using pre-built training CSV with historical signals."""
     import csv as _csv
 
@@ -277,7 +418,10 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     stats = _compute_stats(traded, tp, sl)
     _print_report(stats, all_results, traded, start_date, end_date)
 
-    return stats, all_results
+    # Build funnel breakdown (with training CSV for Stage 2/3 estimates)
+    breakdown = _build_funnel_breakdown(all_results, training_csv=csv_path)
+
+    return stats, breakdown, all_results
 
 
 def _process_training_row(row, tp, sl, hold, threshold):
@@ -287,7 +431,7 @@ def _process_training_row(row, tp, sl, hold, threshold):
         sole_source = sole_source.strip().lower() in ("true", "1", "yes")
 
     base = {
-        "award_date": row.get("posted_date", ""),
+        "award_date": row.get("posted_date", "")[:10],
         "awardee_name": row.get("awardee_name", ""),
         "agency": row.get("agency", ""),
         "award_amount": float(row.get("award_amount", 0)),
@@ -533,11 +677,17 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default=None, help="Path to pre-built dataset JSON from bulk_builder.py")
     parser.add_argument("--training-csv", type=str, default=None,
                         help="Path to training CSV from build_training_set.py (uses historical 8-K, PR, market cap)")
+    parser.add_argument("--max-market-cap", type=int, default=None,
+                        help="Override MAX_MARKET_CAP for this run (in dollars)")
     add_verbosity_flags(parser)
     args = parser.parse_args()
 
     # Initialize logger with user's verbosity preference
     log = setup_logging("backtest", quiet=args.quiet, verbose=args.verbose, json_format=args.json)
+
+    # Extract year from start_date and use year-specific output filename
+    year = args.start.split("-")[0]
+    year_specific_output = os.path.join(os.path.dirname(__file__), f"backtest_results_{year}.csv")
 
     run_backtest(
         start_date=args.start,
@@ -551,4 +701,6 @@ if __name__ == "__main__":
         watchlist_mode=args.watchlist,
         dataset_file=args.dataset,
         training_csv=args.training_csv,
+        output_file=year_specific_output,
+        max_market_cap=args.max_market_cap,
     )

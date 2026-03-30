@@ -906,12 +906,14 @@ class BacktestTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._trades_window = None
+        self._optimizer_max_mcap_m = 500  # Store max_mcap_M from optimizer (in millions)
         self._build_ui()
         # Defer load so startup isn't blocked
         QTimer.singleShot(200, self._load_results)
 
-    def apply_optimizer_params(self, tp: float, sl: float, hold: int, threshold: int):
+    def apply_optimizer_params(self, tp: float, sl: float, hold: int, threshold: int, max_mcap_m: int = 500):
         """Called from OptimizerTab to push best params here."""
+        self._optimizer_max_mcap_m = max_mcap_m
         self._mode_combo.setCurrentIndex(1)   # switch to "Optimized"
         self._tp.setValue(tp)
         self._sl.setValue(sl)
@@ -1066,6 +1068,7 @@ class BacktestTab(QWidget):
             "--sl",        str(self._sl.value()),
             "--hold",      str(self._hold.value()),
             "--threshold", str(self._threshold.value()),
+            "--max-market-cap", str(self._optimizer_max_mcap_m * 1_000_000),  # convert M to full value
         ]
         if OUTPUT_FILES["stage3"].exists():
             args += ["--training-csv", training_csv]
@@ -1085,6 +1088,7 @@ class BacktestTab(QWidget):
         path = SCRIPTS_DIR / "backtest_results_2023.csv"
         headers, rows = _load_csv(path)
         stats = _summary_stats(rows)
+        breakdown = self._calc_breakdown(rows)
 
         # Update summary panel
         # Clear old widgets
@@ -1167,6 +1171,10 @@ class BacktestTab(QWidget):
             row5.addStretch()
             self._summary_lay.addLayout(row5)
 
+            # Add breakdown display
+            breakdown_box = self._display_breakdown(breakdown)
+            self._summary_lay.addWidget(breakdown_box)
+
             self._trades_btn.setEnabled(True)
 
         # Update chart
@@ -1181,6 +1189,196 @@ class BacktestTab(QWidget):
         else:
             self._canvas.clear_plot()
         WATCHER.refresh_watch(path)
+
+    def _calc_breakdown(self, rows):
+        """Calculate contract funnel breakdown from CSV results and Stage 1 raw data."""
+        import re
+        import glob
+        from pathlib import Path
+
+        breakdown = {
+            "stage1_total": 0,
+            "stage1_idiq": 0,
+            "stage1_top20": 0,
+            "stage1_value_range": 0,
+            "stage2_after_build": 0,
+            "stage3_ticker_failed": 0,
+            "stage3_after_enrich": 0,
+            "backtest_market_cap": 0,
+            "backtest_8k": 0,
+            "backtest_dilutive": 0,
+            "backtest_low_score": 0,
+            "backtest_no_ticker": 0,
+            "backtest_no_price": 0,
+            "backtest_duplicate": 0,
+            "traded": 0,
+        }
+
+        # Try to load Stage 1 counts from raw FY2023 CSV
+        try:
+            import polars as pl
+            fy_files = glob.glob("datasets/FY2023*Contracts*") + glob.glob("datasets/FY*Contracts*.csv")
+            if fy_files:
+                csv_file = fy_files[0]
+                try:
+                    df = pl.read_csv(csv_file, infer_schema_length=1000)
+                except:
+                    df = pl.read_csv(csv_file, encoding="latin-1", infer_schema_length=1000)
+
+                total = len(df)
+                breakdown["stage1_total"] = total
+
+                # Count IDIQ
+                idiq_col = next((c for c in df.columns if "idiq" in c.lower()), None)
+                if idiq_col:
+                    breakdown["stage1_idiq"] = df.filter(pl.col(idiq_col) == True).height
+
+                # Count top-20 awardees
+                awardee_col = next((c for c in df.columns if "awardee" in c.lower()), None)
+                if awardee_col:
+                    top20 = df.group_by(awardee_col).agg(pl.count().alias("cnt")).sort("cnt", descending=True).head(20)
+                    top20_names = set(top20.select(awardee_col).to_series())
+                    breakdown["stage1_top20"] = df.filter(pl.col(awardee_col).is_in(top20_names)).height
+
+                # Count value range (outside $1M-$10B)
+                amount_col = next((c for c in df.columns if "amount" in c.lower()), None)
+                if amount_col:
+                    outside_range = df.filter(
+                        (pl.col(amount_col) < 1_000_000) | (pl.col(amount_col) > 10_000_000_000)
+                    ).height
+                    breakdown["stage1_value_range"] = outside_range
+        except Exception:
+            pass  # If raw CSV not available, just skip Stage 1
+
+        # Count backtest-stage removals from CSV
+        for row in rows:
+            reason = row.get("filter_reason", "")
+            fr = row.get("filter_result", "")
+
+            if fr == "pass":
+                breakdown["traded"] += 1
+            elif fr == "low_score":
+                breakdown["backtest_low_score"] += 1
+            elif fr == "no_ticker":
+                breakdown["backtest_no_ticker"] += 1
+            elif fr == "no_price_data":
+                breakdown["backtest_no_price"] += 1
+            elif fr == "duplicate":
+                breakdown["backtest_duplicate"] += 1
+            elif fr == "fail":
+                # Parse failure reason to subcategorize
+                if re.search(r"market cap.*exceeds", reason, re.I):
+                    breakdown["backtest_market_cap"] += 1
+                elif re.search(r"8-K filed", reason, re.I):
+                    breakdown["backtest_8k"] += 1
+                elif re.search(r"dilutive", reason, re.I):
+                    breakdown["backtest_dilutive"] += 1
+
+        # Set stage 3 total from CSV rows
+        breakdown["stage3_after_enrich"] = len(rows)
+        breakdown["stage2_after_build"] = breakdown["stage3_after_enrich"]
+
+        # If we didn't load Stage 1, estimate it from Stage 3 + known removals
+        if breakdown["stage1_total"] == 0:
+            breakdown["stage1_total"] = breakdown["stage3_after_enrich"]
+
+        return breakdown
+
+    def _display_breakdown(self, breakdown):
+        """Display the contract funnel breakdown as a separate section below stats."""
+        # Create breakdown group box
+        breakdown_box = QGroupBox("Contract Funnel Breakdown (2023)")
+        breakdown_lay = QVBoxLayout(breakdown_box)
+        breakdown_lay.setSpacing(4)
+        breakdown_lay.setContentsMargins(8, 8, 8, 8)
+
+        total = breakdown.get("stage1_total", 1)
+        if total == 0:
+            total = breakdown.get("stage3_after_enrich", 1)
+
+        def pct_of_total(count):
+            return (count / total * 100) if total > 0 else 0
+
+        # Helper to add a row
+        def add_row(label, count, indent=0):
+            h = QHBoxLayout()
+            h.setSpacing(10)
+            h.setContentsMargins(indent * 12, 0, 0, 0)
+            lbl = QLabel(label)
+            lbl.setStyleSheet("font-size: 12px; color: #cdd6f4;")
+            pct = pct_of_total(count)
+            val_lbl = QLabel(f"{count:,}  ({pct:.1f}%)")
+            val_lbl.setStyleSheet("font-size: 12px; color: #a6adc8; text-align: right; font-weight: bold;")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            h.addWidget(lbl, 1)
+            h.addWidget(val_lbl, 0, Qt.AlignmentFlag.AlignRight)
+            breakdown_lay.addLayout(h)
+
+        # Stage 1 (Training Build)
+        add_row("─ STAGE 1: TRAINING BUILD", 0, 0)
+        add_row("Total 2023 Contracts", breakdown["stage1_total"], 1)
+        if breakdown["stage1_idiq"] > 0:
+            add_row("Removed: IDIQ", breakdown["stage1_idiq"], 2)
+        if breakdown["stage1_top20"] > 0:
+            add_row("Removed: Top-20 Awardees", breakdown["stage1_top20"], 2)
+        if breakdown["stage1_value_range"] > 0:
+            add_row("Removed: Outside $1M–$10B", breakdown["stage1_value_range"], 2)
+
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setStyleSheet("color: #45475a;")
+        breakdown_lay.addWidget(sep1)
+
+        # Stage 2/3 (Ticker Resolution & Enrichment)
+        passed_build = breakdown["stage1_total"] - breakdown["stage1_idiq"] - breakdown["stage1_top20"] - breakdown["stage1_value_range"]
+        add_row("Passed Build Filters", passed_build, 1)
+        if breakdown["stage3_ticker_failed"] > 0:
+            add_row("Removed: Ticker Failed", breakdown["stage3_ticker_failed"], 2)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet("color: #45475a;")
+        breakdown_lay.addWidget(sep2)
+
+        # Stage 3 (Backtest)
+        add_row("─ STAGE 2: BACKTEST FILTERS", 0, 0)
+        add_row("Ready for Backtest", breakdown["stage3_after_enrich"], 1)
+        if breakdown["backtest_market_cap"] > 0:
+            add_row("Removed: Market Cap > $5B", breakdown["backtest_market_cap"], 2)
+        if breakdown["backtest_8k"] > 0:
+            add_row("Removed: 8-K Filed Within 2d", breakdown["backtest_8k"], 2)
+        if breakdown["backtest_dilutive"] > 0:
+            add_row("Removed: Dilutive Filing", breakdown["backtest_dilutive"], 2)
+        if breakdown["backtest_low_score"] > 0:
+            add_row("Removed: Score < Threshold", breakdown["backtest_low_score"], 2)
+        if breakdown["backtest_no_ticker"] > 0:
+            add_row("Removed: Ticker Resolution Failed", breakdown["backtest_no_ticker"], 2)
+        if breakdown["backtest_no_price"] > 0:
+            add_row("Removed: No Price Data", breakdown["backtest_no_price"], 2)
+        if breakdown["backtest_duplicate"] > 0:
+            add_row("Removed: Duplicate Ticker", breakdown["backtest_duplicate"], 2)
+
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setStyleSheet("color: #a6e3a1;")
+        sep3.setLineWidth(2)
+        breakdown_lay.addWidget(sep3)
+
+        # Final trades row (bold, green)
+        traded_h = QHBoxLayout()
+        traded_h.setSpacing(10)
+        traded_lbl = QLabel("✓ ACTUAL TRADES")
+        traded_lbl.setStyleSheet("font-size: 13px; color: #a6e3a1; font-weight: bold;")
+        traded_pct = pct_of_total(breakdown["traded"])
+        traded_val = QLabel(f"{breakdown['traded']:,}  ({traded_pct:.1f}%)")
+        traded_val.setStyleSheet("font-size: 13px; color: #a6e3a1; font-weight: bold; text-align: right;")
+        traded_val.setAlignment(Qt.AlignmentFlag.AlignRight)
+        traded_h.addWidget(traded_lbl, 1)
+        traded_h.addWidget(traded_val, 0, Qt.AlignmentFlag.AlignRight)
+        breakdown_lay.addLayout(traded_h)
+
+        breakdown_lay.addStretch()
+        return breakdown_box
 
     def _show_trades(self):
         if self._trades_window and not self._trades_window.isVisible():
@@ -1197,8 +1395,8 @@ class BacktestTab(QWidget):
 # ─── OptimizerTab ─────────────────────────────────────────────────────────────
 
 class OptimizerTab(QWidget):
-    # Signal to push best params to the BacktestTab
-    apply_params = pyqtSignal(float, float, int, int)
+    # Signal to push best params to the BacktestTab (tp, sl, hold, threshold, max_mcap_m)
+    apply_params = pyqtSignal(float, float, int, int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1375,7 +1573,8 @@ class OptimizerTab(QWidget):
             sl  = float(b.get("sl_pct", 7.0)) / 100
             hold = int(float(b.get("max_hold_days", 4)))
             thr  = int(float(b.get("score_threshold", 40)))
-            self.apply_params.emit(tp, sl, hold, thr)
+            max_mcap_m = int(float(b.get("max_mcap_M", 500)))  # in millions
+            self.apply_params.emit(tp, sl, hold, thr, max_mcap_m)
         except Exception:
             pass
 

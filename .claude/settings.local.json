@@ -15,7 +15,9 @@
       "Bash(wc -l datasets/*.csv)",
       "Bash(rtk ls:*)",
       "Bash(rtk pip:*)",
-      "Bash(rtk git:*)"
+      "Bash(rtk git:*)",
+      "Bash(ls C:/Users/decla/Desktop/SAMgovArby/*.py)",
+      "Bash(pip install:*)"
     ]
   }
 }

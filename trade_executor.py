@@ -36,13 +36,23 @@ def execute_trade(ticker, score, contract):
     tz = pytz.timezone(TZ)
 
     # Duplicate guard 1: existing Alpaca position
+    # We only catch the expected "no position" exception (tradeapi.rest.APIError).
+    # Any other exception (timeout, auth failure) is re-raised so we don't
+    # silently proceed and risk placing a duplicate trade.
     try:
         existing = api.get_position(ticker)
         if existing:
             log.warning(f"SKIP {ticker}: position already open ({existing.qty} shares)")
             return None
-    except Exception:
-        pass  # no position — good
+    except tradeapi.rest.APIError as e:
+        if "position does not exist" in str(e).lower() or e.status_code == 404:
+            pass  # expected — no existing position
+        else:
+            log.error(f"Alpaca API error checking position for {ticker}: {e}")
+            return None  # abort — don't risk a duplicate
+    except Exception as e:
+        log.error(f"Unexpected error checking position for {ticker}: {e}")
+        return None  # abort — don't risk a duplicate
 
     # Duplicate guard 2: pending open orders
     try:
@@ -50,8 +60,8 @@ def execute_trade(ticker, score, contract):
         if open_orders:
             log.warning(f"SKIP {ticker}: open order already exists")
             return None
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Could not check open orders for {ticker}: {e} — proceeding")
 
     # Get current price
     try:
