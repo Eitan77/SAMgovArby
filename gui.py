@@ -1231,15 +1231,13 @@ class OptimizerTab(QWidget):
         csv_row.addWidget(self._csv_browse)
         sf.addRow("Input CSV:", csv_row)
 
-        one_year_ago = QDate.currentDate().addDays(-365)
-        self._start_date = QDateEdit(one_year_ago)
-        self._start_date.setCalendarPopup(True)
-        self._start_date.setDisplayFormat("yyyy-MM-dd")
-        self._end_date = QDateEdit(QDate.currentDate())
-        self._end_date.setCalendarPopup(True)
-        self._end_date.setDisplayFormat("yyyy-MM-dd")
-        sf.addRow("Start date:", self._start_date)
-        sf.addRow("End date:", self._end_date)
+        # Data year — fixed to 2023
+        year_box = QGroupBox("Data Year")
+        ybf = QVBoxLayout(year_box)
+        yr_lbl = QLabel("2023  (FY2023 — Jan 1 → Dec 31)")
+        yr_lbl.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
+        ybf.addWidget(yr_lbl)
+        lv.addWidget(year_box)
         lv.addWidget(settings)
 
         self._run_btn = QPushButton("▶  Run Optimizer")
@@ -1295,11 +1293,6 @@ class OptimizerTab(QWidget):
 
         self._best_row: dict = {}
 
-    def _on_mode_change(self, idx: int):
-        is_cache = idx == 1
-        self._start_date.setEnabled(not is_cache)
-        self._end_date.setEnabled(not is_cache)
-
     def _browse_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select CSV", str(DATASETS_DIR), "CSV (*.csv)")
         if path:
@@ -1311,11 +1304,11 @@ class OptimizerTab(QWidget):
             args = [
                 str(SCRIPTS_DIR / "optimizer.py"),
                 "from-training-csv", csv_path,
-                "--start", self._start_date.date().toString("yyyy-MM-dd"),
-                "--end",   self._end_date.date().toString("yyyy-MM-dd"),
+                "--start", "2023-01-01",
+                "--end",   "2023-12-31",
             ]
         else:
-            cache = self._csv_path.text() or str(OUTPUT_FILES["backtest"])
+            cache = self._csv_path.text() or str(SCRIPTS_DIR / "backtest_results_2023.csv")
             args = [str(SCRIPTS_DIR / "optimizer.py"), "from-cache", cache]
 
         self._run_btn.setEnabled(False)
@@ -1329,9 +1322,11 @@ class OptimizerTab(QWidget):
         self._load_results()
 
     def _load_results(self):
-        headers, rows = _load_csv(OUTPUT_FILES["optimizer"])
+        # optimizer.py writes to optimizer_results_2023.csv (year-specific)
+        path = SCRIPTS_DIR / "optimizer_results_2023.csv"
+        headers, rows = _load_csv(path)
         if not rows:
-            WATCHER.refresh_watch(OUTPUT_FILES["optimizer"])
+            WATCHER.refresh_watch(path)
             return
 
         # Sort best first
@@ -1388,7 +1383,7 @@ class OptimizerTab(QWidget):
 
         self._apply_btn.setEnabled(True)
         self._view_all_btn.setEnabled(True)
-        WATCHER.refresh_watch(OUTPUT_FILES["optimizer"])
+        WATCHER.refresh_watch(path)
 
     def _apply_best(self):
         b = self._best_row
@@ -1407,8 +1402,9 @@ class OptimizerTab(QWidget):
         if self._results_window and not self._results_window.isVisible():
             self._results_window = None
         if not self._results_window:
+            results_file = SCRIPTS_DIR / "optimizer_results_2023.csv"
             self._results_window = TradesDialog(
-                OUTPUT_FILES["optimizer"], "All Optimizer Results"
+                results_file, "All Optimizer Results"
             )
         self._results_window.show()
         self._results_window.raise_()
