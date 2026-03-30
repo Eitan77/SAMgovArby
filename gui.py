@@ -1046,9 +1046,9 @@ class BacktestTab(QWidget):
         except Exception:
             pass
         best = rows[0]
-        try: self._tp.setValue(float(best.get("tp_pct", 0.08)))
+        try: self._tp.setValue(float(best.get("tp_pct", 8.0)) / 100)  # stored as 8.0, convert to 0.08
         except Exception: pass
-        try: self._sl.setValue(float(best.get("sl_pct", 0.07)))
+        try: self._sl.setValue(float(best.get("sl_pct", 7.0)) / 100)
         except Exception: pass
         try: self._hold.setValue(int(float(best.get("max_hold_days", 4))))
         except Exception: pass
