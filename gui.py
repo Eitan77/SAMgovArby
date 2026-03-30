@@ -903,7 +903,6 @@ class BacktestTab(QWidget):
         super().__init__(parent)
         self._trades_window = None
         self._build_ui()
-        self._populate_years()
         # Defer load so startup isn't blocked
         QTimer.singleShot(200, self._load_results)
 
@@ -937,13 +936,12 @@ class BacktestTab(QWidget):
         mbl.addWidget(self._mode_combo)
         lv.addWidget(mode_box)
 
-        # Year selection
+        # Data year — fixed to 2023 (FY2023 dataset)
         year_box = QGroupBox("Data Year")
-        ybf = QFormLayout(year_box)
-        ybf.setSpacing(6)
-        self._year_combo = QComboBox()
-        self._year_combo.currentIndexChanged.connect(self._on_year_changed)
-        ybf.addRow("Year:", self._year_combo)
+        ybf = QVBoxLayout(year_box)
+        yr_lbl = QLabel("2023  (FY2023 — Jan 1 → Dec 31)")
+        yr_lbl.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
+        ybf.addWidget(yr_lbl)
         lv.addWidget(year_box)
 
         # Parameters
@@ -1027,31 +1025,6 @@ class BacktestTab(QWidget):
         container.setLayout(right)
         root.addWidget(container)
 
-    def _populate_years(self):
-        """Scan for backtest_results_*.csv files and populate year dropdown."""
-        import glob
-        pattern = str(SCRIPTS_DIR / "backtest_results_*.csv")
-        files = glob.glob(pattern)
-        years = []
-        for f in files:
-            # Extract year from filename: backtest_results_2023.csv -> 2023
-            fname = os.path.basename(f)
-            try:
-                year = fname.split("_")[2].split(".")[0]
-                years.append(year)
-            except (IndexError, ValueError):
-                pass
-        years.sort(reverse=True)  # Newest first
-        self._year_combo.blockSignals(True)
-        self._year_combo.clear()
-        self._year_combo.addItems(years)
-        self._year_combo.blockSignals(False)
-
-    def _on_year_changed(self, idx: int):
-        """Handle year dropdown selection change."""
-        if idx >= 0:
-            self._load_results()
-
     def _on_mode_change(self, idx: int):
         is_custom = (idx == 0)
         self._params_box.setEnabled(is_custom)
@@ -1079,19 +1052,11 @@ class BacktestTab(QWidget):
         except Exception: pass
 
     def _run_backtest(self):
-        # Get selected year and generate date range
-        year = self._year_combo.currentText()
-        if not year:
-            log.warning("No year selected for backtest")
-            return
-        start_date = f"{year}-01-01"
-        end_date = f"{year}-12-31"
-
         training_csv = str(OUTPUT_FILES["stage3"])
         args = [
             str(SCRIPTS_DIR / "backtest.py"),
-            "--start",     start_date,
-            "--end",       end_date,
+            "--start",     "2023-01-01",
+            "--end",       "2023-12-31",
             "--tp",        str(self._tp.value()),
             "--sl",        str(self._sl.value()),
             "--hold",      str(self._hold.value()),
@@ -1111,13 +1076,7 @@ class BacktestTab(QWidget):
         self._load_results()
 
     def _load_results(self):
-        # Get year-specific CSV file
-        year = self._year_combo.currentText()
-        if not year:
-            path = OUTPUT_FILES["backtest"]
-        else:
-            path = SCRIPTS_DIR / f"backtest_results_{year}.csv"
-
+        path = OUTPUT_FILES["backtest"]
         headers, rows = _load_csv(path)
         stats = _summary_stats(rows)
 
