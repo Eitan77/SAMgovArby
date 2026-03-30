@@ -1058,6 +1058,7 @@ class BacktestTab(QWidget):
     def _run_backtest(self):
         training_csv = str(OUTPUT_FILES["stage3"])
         args = [
+            "-u",  # unbuffered output
             str(SCRIPTS_DIR / "backtest.py"),
             "--start",     "2023-01-01",
             "--end",       "2023-12-31",
@@ -1218,29 +1219,14 @@ class OptimizerTab(QWidget):
         lv.setSpacing(10)
 
         settings = QGroupBox("Optimizer Settings")
-        sf = QFormLayout(settings)
+        sf = QVBoxLayout(settings)
         sf.setSpacing(8)
 
-        self._mode = QComboBox()
-        self._mode.addItems(["From Training CSV (offline)", "From Backtest Cache"])
-        sf.addRow("Mode:", self._mode)
-
-        self._csv_path = QLineEdit()
-        self._csv_path.setPlaceholderText("Default: training_set_final.csv")
-        self._csv_browse = QPushButton("Browse...")
-        self._csv_browse.clicked.connect(self._browse_csv)
-        csv_row = QHBoxLayout()
-        csv_row.addWidget(self._csv_path)
-        csv_row.addWidget(self._csv_browse)
-        sf.addRow("Input CSV:", csv_row)
-
         # Data year — fixed to 2023
-        year_box = QGroupBox("Data Year")
-        ybf = QVBoxLayout(year_box)
-        yr_lbl = QLabel("2023  (FY2023 — Jan 1 → Dec 31)")
+        yr_lbl = QLabel("Data Year: 2023  (FY2023 — Jan 1 → Dec 31)")
         yr_lbl.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
-        ybf.addWidget(yr_lbl)
-        lv.addWidget(year_box)
+        sf.addWidget(yr_lbl)
+
         lv.addWidget(settings)
 
         self._run_btn = QPushButton("▶  Run Optimizer")
@@ -1296,23 +1282,15 @@ class OptimizerTab(QWidget):
 
         self._best_row: dict = {}
 
-    def _browse_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select CSV", str(DATASETS_DIR), "CSV (*.csv)")
-        if path:
-            self._csv_path.setText(path)
-
     def _run_optimizer(self):
-        csv_path = self._csv_path.text() or str(OUTPUT_FILES["stage3"])
-        if self._mode.currentIndex() == 0:
-            args = [
-                str(SCRIPTS_DIR / "optimizer.py"),
-                "from-training-csv", csv_path,
-                "--start", "2023-01-01",
-                "--end",   "2023-12-31",
-            ]
-        else:
-            cache = self._csv_path.text() or str(SCRIPTS_DIR / "backtest_results_2023.csv")
-            args = [str(SCRIPTS_DIR / "optimizer.py"), "from-cache", cache]
+        csv_path = str(OUTPUT_FILES["stage3"])
+        args = [
+            "-u",  # unbuffered output
+            str(SCRIPTS_DIR / "optimizer.py"),
+            "from-training-csv", csv_path,
+            "--start", "2023-01-01",
+            "--end",   "2023-12-31",
+        ]
 
         self._run_btn.setEnabled(False)
         self._progress.setVisible(True)
