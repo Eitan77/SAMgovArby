@@ -2,26 +2,36 @@
 
 Government contract arbitrage pipeline. Finds small-cap stock opportunities from federal contract awards.
 
-## Token Optimization (RTK)
+## ⚠️ TOKEN OPTIMIZATION (RTK) — MANDATORY, NON-NEGOTIABLE
 
-**ALWAYS prefix bash commands with `rtk`** — saves 60-90% tokens on output.
+**EVERY bash command MUST have `rtk` prefix. This is not optional.**
+
+**This saves 60-90% tokens. Violation wastes your money and will result in subscription cancellation.**
 
 ```bash
-# Build & Run (90%+ savings)
-rtk python build_training_set.py    # Only errors & progress lines
-rtk python -m pytest tests/          # Only test failures (99%)
-
-# Git (59-80% savings)
-rtk git status                       # Compact status
+# ALL commands must use rtk:
+rtk python build_training_set.py    # 90%+ savings
+rtk python -m pytest tests/          # 99% savings
+rtk git status                       # 59-80% savings
 rtk git log --oneline -10           # Compact log
-rtk git diff                         # Diff with 80% token savings
-
-# File inspection (60-75% savings)
-rtk ls -la datasets/                 # Tree format, minimal
-rtk grep "ERROR" build_training_set.py  # Grouped by file
+rtk git diff                         # 80% savings
+rtk ls -la datasets/                 # 65% savings
+rtk grep "ERROR" file.py             # 75% savings
+rtk find . -name "*.csv"             # 70% savings
+rtk curl https://example.com         # 70% savings
 ```
 
-**RTK golden rule:** Always safe to use, always passes through if no filter exists. Never breaks commands.
+**NO EXCEPTIONS. Use `rtk` even if unsure.**
+- It's always safe—passes through unchanged if no filter exists
+- Never breaks commands
+- Always saves tokens or at worst does nothing
+
+**Savings breakdown:**
+- Tests (pytest/vitest/playwright): 90-99%
+- Build (cargo/tsc/next/prettier): 70-87%
+- Git (status/log/diff/add/commit/push): 59-80%
+- Files (ls/grep/find): 60-75%
+- Network (curl/wget): 65-70%
 
 ## Key Files
 - `build_training_set.py` — 3-stage training dataset builder (checkpoint-resumable)
