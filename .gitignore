@@ -4,3 +4,10 @@ __pycache__/
 positions.csv
 trade_log.csv
 signal_log.csv
+datasets/
+.award_cache/
+.ticker_cache_v2.json
+.edgar_tickers.json
+pipeline.log
+*.csv
+hr/
