@@ -1303,8 +1303,8 @@ class OptimizerTab(QWidget):
         self._load_results()
 
     def _load_results(self):
-        # optimizer.py writes to optimizer_results_2023.csv (year-specific)
-        path = SCRIPTS_DIR / "optimizer_results_2023.csv"
+        # optimizer.py writes to optimizer_results.csv (not year-specific)
+        path = SCRIPTS_DIR / "optimizer_results.csv"
         headers, rows = _load_csv(path)
         if not rows:
             WATCHER.refresh_watch(path)
@@ -1383,7 +1383,7 @@ class OptimizerTab(QWidget):
         if self._results_window and not self._results_window.isVisible():
             self._results_window = None
         if not self._results_window:
-            results_file = SCRIPTS_DIR / "optimizer_results_2023.csv"
+            results_file = SCRIPTS_DIR / "optimizer_results.csv"
             self._results_window = TradesDialog(
                 results_file, "All Optimizer Results"
             )
