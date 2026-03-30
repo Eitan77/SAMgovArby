@@ -1331,7 +1331,7 @@ class OptimizerTab(QWidget):
         row1 = QHBoxLayout(); row1.setSpacing(6)
         def _pct(key, default=""):
             v = best.get(key, default)
-            try: return f"{float(v):.1%}"  # already decimal, format as percentage
+            try: return f"{float(v)/100:.1%}"  # stored as 8.0 → 8.0%
             except Exception: return str(v)
         def _val(key, default=""):
             return best.get(key, default)
@@ -1371,8 +1371,8 @@ class OptimizerTab(QWidget):
         if not b:
             return
         try:
-            tp  = float(b.get("tp_pct", 0.08))
-            sl  = float(b.get("sl_pct", 0.07))
+            tp  = float(b.get("tp_pct", 8.0)) / 100  # stored as 8.0, convert to 0.08
+            sl  = float(b.get("sl_pct", 7.0)) / 100
             hold = int(float(b.get("max_hold_days", 4)))
             thr  = int(float(b.get("score_threshold", 40)))
             self.apply_params.emit(tp, sl, hold, thr)
