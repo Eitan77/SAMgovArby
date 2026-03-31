@@ -17,7 +17,7 @@ from config import SCORE_THRESHOLD, TZ, POLL_INTERVAL_HOURS
 from sam_poller import fetch_recent_awards
 from filter_engine import apply_filters
 from scoring_engine import score_contract
-from ticker_resolver import resolve_ticker
+from ticker_resolver_v3 import resolve_ticker
 from trade_executor import execute_trade, check_and_exit_expired_positions
 
 # --- Logging setup ---
@@ -126,9 +126,11 @@ def run_pipeline():
 
         if not ticker:
             try:
+                cage_code = contract.get("cage_code", "")  # Assume SAM.gov provides this
                 ticker, confidence = resolve_ticker(
                     contract["awardee_name"],
                     edgar_results=extra.get("edgar_results"),
+                    cage_code=cage_code
                 )
             except Exception as e:
                 log.error(f"Ticker resolution error for {contract['awardee_name']}: {e}")
