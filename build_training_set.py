@@ -242,6 +242,7 @@ def _parse_bulk_row(row: dict, month_filter: int = 0) -> tuple | None:
             "extent_competed": row.get("extent_competed") or "",
             "sole_source":     sole_source,
             "is_idiq":         is_idiq,
+            "parent_recipient_name": (row.get("recipient_parent_name") or "").strip(),
         }
     except (ValueError, TypeError) as e:
         log.debug(f"Parse error: {e}")
@@ -413,7 +414,7 @@ def stage2_resolve_tickers(awards: list[dict]) -> list[dict]:
     Deduplicates by company name first — resolves once per unique name, then maps
     the result to all awards with that name. Sequential, resumable via checkpoint.
     """
-    from ticker_resolver import TickerResolverV2
+    from ticker_resolver_v3 import TickerResolverV3
 
     log.info("=" * 60)
     log.info("STAGE 2: TICKER RESOLUTION")
@@ -429,7 +430,7 @@ def stage2_resolve_tickers(awards: list[dict]) -> list[dict]:
         log.info(f"  Resuming: {already_done:,} awards already in checkpoint")
 
     edgar_map = _load_edgar_map()
-    resolver  = TickerResolverV2(edgar_map, cache_path=TICKER_CACHE_V2_FILE)
+    resolver  = TickerResolverV3(edgar_map, cache_path=TICKER_CACHE_V2_FILE)
 
     # Deduplicate: resolve once per unique company name, then map to all awards
     # Build name → [award_keys] mapping for awards not yet in checkpoint
@@ -450,8 +451,17 @@ def stage2_resolve_tickers(awards: list[dict]) -> list[dict]:
     resolved_count = unresolved_count = 0
     CHECKPOINT_BATCH = 200
 
+    # Build name → parent_name mapping for parent escalation
+    name_to_parent: dict[str, str] = {}
+    for award in awards:
+        name = award["awardee_name"]
+        parent = award.get("parent_recipient_name", "")
+        if parent and name not in name_to_parent:
+            name_to_parent[name] = parent
+
     for i, name in enumerate(unique_names):
-        result = resolver.resolve(name)
+        parent = name_to_parent.get(name, "")
+        result = resolver.resolve(name, parent_name=parent)
         ticker = result.get("resolved_ticker") or ""
         entry  = {
             "ticker":            ticker,
@@ -471,13 +481,18 @@ def stage2_resolve_tickers(awards: list[dict]) -> list[dict]:
         if (i + 1) % CHECKPOINT_BATCH == 0:
             _save_cp(CP_STAGE2, cp)
             pct = (i + 1) / len(unique_names) * 100
+            pct_resolved = resolved_count / (i + 1) * 100 if (i + 1) > 0 else 0
             log.info(f"  [{i+1:,}/{len(unique_names):,} — {pct:.1f}%] "
-                     f"resolved={resolved_count:,}  unresolved={unresolved_count:,}")
+                     f"resolved={resolved_count:,} ({pct_resolved:.1f}%)  unresolved={unresolved_count:,}")
+            # Also emit a compact progress line for GUI parsing
+            print(f"[STAGE2_PROGRESS] {pct:.0f}% | Resolved: {resolved_count:,} | Unresolved: {unresolved_count:,}")
 
     resolver.save_cache()
     _save_cp(CP_STAGE2, cp)
-    log.info(f"  Resolution complete: {resolved_count:,} resolved, "
+    pct_resolved = resolved_count / len(unique_names) * 100 if unique_names else 0
+    log.info(f"  Resolution complete: {resolved_count:,} resolved ({pct_resolved:.1f}%), "
              f"{unresolved_count:,} unresolved, {skipped_count:,} from checkpoint")
+    print(f"[STAGE2_COMPLETE] {resolved_count:,} resolved | {unresolved_count:,} unresolved | {pct_resolved:.1f}%")
 
     # Merge ticker data back into award rows
     enriched = []
