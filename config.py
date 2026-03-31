@@ -44,6 +44,17 @@ EDGAR_USER_AGENT = os.getenv("EDGAR_USER_AGENT", "SAMgovArby research@example.co
 # (distinct from MAX_8K_WINDOW_DAYS which is the filter rejection window)
 EDGAR_8K_ENRICHMENT_DAYS = 30
 
+# GLEIF API (free, no auth)
+GLEIF_SEARCH_URL = "https://leilookup.gleif.org/api/v3/lei-records"
+
+# OpenFIGI API (free, no daily limits)
+OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
+
+# Cache TTLs (days)
+LEI_CACHE_TTL = 30
+TICKER_CACHE_TTL = 7
+CAGE_CACHE_TTL = 30
+
 # Hot sectors (NAICS prefixes)
 HOT_SECTOR_NAICS = {
     "336411", "336414", "336415", "336419",  # aerospace/defense mfg
