@@ -108,7 +108,7 @@ def read_sam_gov_csv(path: str) -> Iterator[ContractRecord]:
 
             # Hard-reject: unparseable or out-of-range amount
             try:
-                amount = float((row.get(_AMOUNT_COL) or "0").replace(",", ""))
+                amount = float((row.get(_AMOUNT_COL) or "0").replace("$", "").replace(",", ""))
             except (ValueError, TypeError):
                 continue
             if amount < MIN_CONTRACT_VALUE or amount > MAX_AWARD_AMOUNT:

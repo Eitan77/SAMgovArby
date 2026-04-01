@@ -51,6 +51,7 @@ from config import (
     MIN_CONTRACT_VALUE, MAX_AWARD_AMOUNT, TOP_N_TO_REMOVE,
     EDGAR_RATE_LIMIT, EDGAR_8K_ENRICHMENT_DAYS, EDGAR_USER_AGENT,
 )
+from sam_gov_reader import read_sam_gov_csv, find_sam_gov_csv, ContractRecord
 
 # ─── Logging (initialized in main, default for module-level usage) ─────────────
 
@@ -62,6 +63,7 @@ ROOT = os.path.dirname(__file__)
 DATASET_DIR = os.path.join(ROOT, "datasets")
 CHECKPOINT_DIR = os.path.join(DATASET_DIR, "checkpoints")
 TICKER_CACHE_V2_FILE = os.path.join(ROOT, ".ticker_cache_v2.json")
+TICKER_CACHE_V4_FILE = os.path.join(ROOT, ".ticker_cache_v4.json")
 EDGAR_MAP_FILE = os.path.join(ROOT, ".edgar_tickers.json")
 
 FILTERED_CSV = os.path.join(DATASET_DIR, "filtered_training_set.csv")
@@ -249,60 +251,83 @@ def _parse_bulk_row(row: dict, month_filter: int = 0) -> tuple | None:
         return None
 
 
-def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> list[dict]:
-    """Load bulk CSV, filter by amount, remove top-N companies and IDIQ, write filtered CSV.
+def _record_to_award_dict(record: ContractRecord) -> dict:
+    """Map a ContractRecord to the award dict format used by downstream stages."""
+    sole_source = (
+        record.num_offers == "1"
+        or record.extent_competed_code in ("B", "C", "G", "CDO", "URG", "SP2")
+        or (record.other_than_full_open or "").strip().upper() not in ("", "NO", "N")
+    )
+    return {
+        "award_key":             record.piid,
+        "award_id":              record.piid,
+        "posted_date":           record.posted_date,
+        "awardee_name":          record.contractor_name or record.legal_business_name,
+        "legal_business_name":   record.legal_business_name,
+        "dba_name":              record.dba_name,
+        "cage_code":             record.cage_code,
+        "uei":                   record.uei,
+        "award_amount":          record.award_amount,
+        "agency":                record.agency,
+        "sub_agency":            "",
+        "naics":                 record.naics_code,
+        "naics_description":     record.naics_description,
+        "set_aside":             record.set_aside_code,
+        "extent_competed":       record.extent_competed_code,
+        "sole_source":           sole_source,
+        "is_idiq":               False,  # already filtered out by reader
+        "parent_recipient_name": record.parent_name,
+    }
 
-    Args:
-        month_filter: Filter to specific month (1-12) or 0 for all months
+
+def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[list[dict], dict[str, ContractRecord]]:
+    """Load SAM.gov bulk CSV, filter by amount, remove top-N companies, write filtered CSV.
+
+    Returns:
+        (awards, records_by_key) where records_by_key maps piid → ContractRecord
+        for use by Stage 2's V4 resolver.
     """
     log.info("=" * 60)
     log.info("STAGE 1: LOAD & FILTER")
     log.info(f"  Range  : ${MIN_CONTRACT_VALUE/1e6:.0f}M – ${MAX_AWARD_AMOUNT/1e9:.0f}B")
     log.info(f"  Remove : top {TOP_N_TO_REMOVE} companies by contract count")
-    log.info(f"  Remove : all IDIQ contracts")
+    log.info(f"  Remove : IDV/IDIQ contracts (filtered at read time)")
     if month_filter:
         log.info(f"  Month  : {month_filter} (March=3)")
     log.info(f"  Output : {os.path.basename(FILTERED_CSV)}")
     log.info("=" * 60)
     t0 = time.time()
 
-    bulk_file = _find_bulk_file(year)
-    if not bulk_file:
-        log.error(f"No bulk file found for FY{year} in {DATASET_DIR}/")
-        log.error("Download: https://files.usaspending.gov/award_data_archive/")
+    sam_csv = find_sam_gov_csv(DATASET_DIR)
+    if not sam_csv:
+        log.error(f"No SAM.gov CSV found in {DATASET_DIR}/")
+        log.error("Download a report from https://sam.gov/ and place it in datasets/")
         sys.exit(1)
-    log.info(f"  Source: {os.path.basename(bulk_file)}")
+    log.info(f"  Source: {os.path.basename(sam_csv)}")
 
     awards_by_key: dict[str, dict] = {}
+    records_by_key: dict[str, ContractRecord] = {}
     total_rows = 0
 
-    def _ingest(fileobj):
-        nonlocal total_rows
-        reader = csv.DictReader(io.TextIOWrapper(fileobj, encoding="utf-8", errors="replace"))
-        for row in reader:
-            total_rows += 1
-            result = _parse_bulk_row(row, month_filter=month_filter)
-            if result:
-                key, parsed = result
-                awards_by_key[key] = parsed  # latest transaction overwrites earlier
-            if total_rows % 500_000 == 0:
-                log.info(f"  ... {total_rows:,} rows read, {len(awards_by_key):,} unique awards so far")
+    for record in read_sam_gov_csv(sam_csv):
+        total_rows += 1
 
-    if bulk_file.lower().endswith(".zip"):
-        with zipfile.ZipFile(bulk_file, "r") as zf:
-            csv_names = sorted(n for n in zf.namelist() if n.lower().endswith(".csv"))
-            log.info(f"  Zip contains {len(csv_names)} CSV file(s)")
-            for i, csv_name in enumerate(csv_names, 1):
-                log.info(f"  [{i}/{len(csv_names)}] Reading {csv_name}...")
-                with zf.open(csv_name) as raw:
-                    _ingest(raw)
-    else:
-        with open(bulk_file, "rb") as f:
-            _ingest(f)
+        if month_filter and record.posted_date:
+            try:
+                if int(record.posted_date.split("-")[1]) != month_filter:
+                    continue
+            except (ValueError, IndexError):
+                pass
+
+        awards_by_key[record.piid] = _record_to_award_dict(record)
+        records_by_key[record.piid] = record
+
+        if total_rows % 50_000 == 0:
+            log.info(f"  ... {total_rows:,} rows read, {len(awards_by_key):,} unique awards so far")
 
     awards = list(awards_by_key.values())
-    after_dedup = len(awards)
-    log.info(f"  {total_rows:,} rows read → {after_dedup:,} unique awards (dedup + amount filter)")
+    after_load = len(awards)
+    log.info(f"  {total_rows:,} rows read → {after_load:,} awards (amount/IDV filtered at read time)")
 
     # ── Remove top-N companies by contract count ──────────────────────────────
     name_counts = Counter(a["awardee_name"] for a in awards)
@@ -312,29 +337,22 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> list[dict
         log.info(f"    {cnt:>6,}  {name}")
 
     awards = [a for a in awards if a["awardee_name"] not in top_names]
-    dropped_top20 = after_dedup - len(awards)
-    log.info(f"  Dropped {dropped_top20:,} contracts from top-{TOP_N_TO_REMOVE} companies")
-
-    # ── Remove IDIQ contracts ─────────────────────────────────────────────────
-    pre_idiq = len(awards)
-    awards = [a for a in awards if not a.get("is_idiq")]
-    dropped_idiq = pre_idiq - len(awards)
-    log.info(f"  Dropped {dropped_idiq:,} IDIQ contracts")
+    records_by_key = {a["award_key"]: records_by_key[a["award_key"]] for a in awards}
+    dropped_top = after_load - len(awards)
+    log.info(f"  Dropped {dropped_top:,} contracts from top-{TOP_N_TO_REMOVE} companies")
     log.info(f"  Final: {len(awards):,} contracts")
 
-    # Write filtered CSV (is_idiq column no longer needed but harmless to keep)
     _write_csv(FILTERED_CSV, awards)
 
     _save_cp(CP_STAGE1, {
         "total_rows_read": total_rows,
-        "unique_after_dedup_and_amount_filter": after_dedup,
-        "dropped_top20": dropped_top20,
-        "dropped_idiq": dropped_idiq,
+        "after_load": after_load,
+        "dropped_top_n": dropped_top,
         "final_count": len(awards),
     })
 
     log.info(f"Stage 1 complete in {_elapsed(t0)}")
-    return awards
+    return awards, records_by_key
 
 
 def build_agency_history(awards: list[dict]) -> dict:
@@ -408,18 +426,21 @@ def _load_edgar_map() -> dict:
     return edgar_map
 
 
-def stage2_resolve_tickers(awards: list[dict]) -> list[dict]:
-    """Resolve each award's company name to a ticker.
+def stage2_resolve_tickers(
+    awards: list[dict],
+    records_by_key: dict[str, ContractRecord] | None = None,
+) -> list[dict]:
+    """Resolve each award's company to a ticker using TickerResolverV4.
 
-    Deduplicates by company name first — resolves once per unique name, then maps
-    the result to all awards with that name. Sequential, resumable via checkpoint.
+    Deduplicates by V4 cache key (CAGE code → UEI → legal name → contractor name),
+    resolves once per unique entity, then maps to all matching awards.
     """
-    from ticker_resolver_v3 import TickerResolverV3
+    from ticker_resolver_v4 import TickerResolverV4
 
     log.info("=" * 60)
-    log.info("STAGE 2: TICKER RESOLUTION")
+    log.info("STAGE 2: TICKER RESOLUTION (V4)")
     log.info(f"  Input  : {len(awards):,} filtered awards")
-    log.info(f"  Cache  : {os.path.basename(TICKER_CACHE_V2_FILE)}")
+    log.info(f"  Cache  : {os.path.basename(TICKER_CACHE_V4_FILE)}")
     log.info(f"  Output : {os.path.basename(STAGE2_CSV)}")
     log.info("=" * 60)
     t0 = time.time()
@@ -430,71 +451,82 @@ def stage2_resolve_tickers(awards: list[dict]) -> list[dict]:
         log.info(f"  Resuming: {already_done:,} awards already in checkpoint")
 
     edgar_map = _load_edgar_map()
-    resolver  = TickerResolverV3(edgar_map, cache_path=TICKER_CACHE_V2_FILE)
+    resolver  = TickerResolverV4(edgar_map, cache_path=TICKER_CACHE_V4_FILE)
 
-    # Deduplicate: resolve once per unique company name, then map to all awards
-    # Build name → [award_keys] mapping for awards not yet in checkpoint
-    name_to_keys: dict[str, list[str]] = {}
+    # Deduplicate by V4 cache key: resolve once per unique entity
+    def _v4_key(award: dict) -> str:
+        return (
+            award.get("cage_code")
+            or award.get("uei")
+            or award.get("legal_business_name")
+            or award.get("awardee_name")
+            or ""
+        )
+
+    entity_key_to_award_keys: dict[str, list[str]] = {}
     skipped_count = 0
     for award in awards:
-        key = award["award_key"]
-        if key in cp:
+        award_key = award["award_key"]
+        if award_key in cp:
             skipped_count += 1
         else:
-            name = award["awardee_name"]
-            name_to_keys.setdefault(name, []).append(key)
+            ek = _v4_key(award)
+            entity_key_to_award_keys.setdefault(ek, []).append(award_key)
 
-    unique_names = list(name_to_keys.keys())
-    log.info(f"  {len(awards):,} awards → {len(unique_names):,} unique names to resolve "
+    # Pick one representative award_key per entity (to get its ContractRecord)
+    unique_entity_keys = list(entity_key_to_award_keys.keys())
+    # Build entity_key → ContractRecord mapping using first award in each group
+    ek_to_record: dict[str, ContractRecord] = {}
+    if records_by_key:
+        for ek, award_keys in entity_key_to_award_keys.items():
+            for ak in award_keys:
+                if ak in records_by_key:
+                    ek_to_record[ek] = records_by_key[ak]
+                    break
+
+    log.info(f"  {len(awards):,} awards → {len(unique_entity_keys):,} unique entities to resolve "
              f"({skipped_count:,} from checkpoint)")
 
     resolved_count = unresolved_count = 0
     CHECKPOINT_BATCH = 200
 
-    # Build name → parent_name mapping for parent escalation
-    name_to_parent: dict[str, str] = {}
-    for award in awards:
-        name = award["awardee_name"]
-        parent = award.get("parent_recipient_name", "")
-        if parent and name not in name_to_parent:
-            name_to_parent[name] = parent
-
-    for i, name in enumerate(unique_names):
-        parent = name_to_parent.get(name, "")
-        result = resolver.resolve(name, parent_name=parent)
-        ticker = result.get("resolved_ticker") or ""
-        entry  = {
-            "ticker":            ticker,
-            "cik":               result.get("resolved_cik") or "",
-            "ticker_confidence": result.get("confidence", "none"),
-        }
-
-        # Apply to all awards with this name
-        for key in name_to_keys[name]:
-            cp[key] = entry
-
-        if ticker:
-            resolved_count += 1
-        else:
+    for i, ek in enumerate(unique_entity_keys):
+        record = ek_to_record.get(ek)
+        if record is None:
             unresolved_count += 1
+            entry = {"ticker": "", "cik": "", "ticker_confidence": "none"}
+        else:
+            result = resolver.resolve(record)
+            ticker = result.get("resolved_ticker") or ""
+            entry  = {
+                "ticker":            ticker,
+                "cik":               result.get("resolved_cik") or "",
+                "ticker_confidence": result.get("confidence", "none"),
+                "evidence_type":     result.get("evidence_type", ""),
+            }
+            if ticker:
+                resolved_count += 1
+            else:
+                unresolved_count += 1
+
+        for ak in entity_key_to_award_keys[ek]:
+            cp[ak] = entry
 
         if (i + 1) % CHECKPOINT_BATCH == 0:
             _save_cp(CP_STAGE2, cp)
-            pct = (i + 1) / len(unique_names) * 100
-            pct_resolved = resolved_count / (i + 1) * 100 if (i + 1) > 0 else 0
-            log.info(f"  [{i+1:,}/{len(unique_names):,} — {pct:.1f}%] "
+            pct = (i + 1) / len(unique_entity_keys) * 100
+            pct_resolved = resolved_count / (i + 1) * 100
+            log.info(f"  [{i+1:,}/{len(unique_entity_keys):,} — {pct:.1f}%] "
                      f"resolved={resolved_count:,} ({pct_resolved:.1f}%)  unresolved={unresolved_count:,}")
-            # Also emit a compact progress line for GUI parsing
             print(f"[STAGE2_PROGRESS] {pct:.0f}% | Resolved: {resolved_count:,} | Unresolved: {unresolved_count:,}")
 
     resolver.save_cache()
     _save_cp(CP_STAGE2, cp)
-    pct_resolved = resolved_count / len(unique_names) * 100 if unique_names else 0
+    pct_resolved = resolved_count / len(unique_entity_keys) * 100 if unique_entity_keys else 0
     log.info(f"  Resolution complete: {resolved_count:,} resolved ({pct_resolved:.1f}%), "
              f"{unresolved_count:,} unresolved, {skipped_count:,} from checkpoint")
     print(f"[STAGE2_COMPLETE] {resolved_count:,} resolved | {unresolved_count:,} unresolved | {pct_resolved:.1f}%")
 
-    # Merge ticker data back into award rows
     enriched = []
     for award in awards:
         entry = cp.get(award["award_key"], {})
@@ -978,7 +1010,7 @@ def main():
     month_filter = 0  # All months (full year)
 
     # Stage 1 — load & filter (fast, reads local file)
-    awards = stage1_load_and_filter(year, month_filter=month_filter)
+    awards, records_by_key = stage1_load_and_filter(year, month_filter=month_filter)
 
     # Agency history — cheap in-memory pass over filtered set
     agency_history = build_agency_history(awards)
@@ -986,7 +1018,7 @@ def main():
     log.info(f"Agency history: {first_wins:,} first-time agency wins out of {len(agency_history):,}")
 
     # Stage 2 — ticker resolution (sequential, resumable)
-    awards = stage2_resolve_tickers(awards)
+    awards = stage2_resolve_tickers(awards, records_by_key=records_by_key)
 
     # Stage 3 — enrich (prices, shares, historical mcap, 8-K, dilutive filings)
     final = stage3_enrich(awards, agency_history)
