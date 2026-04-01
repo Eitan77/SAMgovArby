@@ -1496,9 +1496,9 @@ class TrainingDataTab(QWidget):
         root.setSpacing(10)
 
         info = QLabel(
-            "Download USASpending bulk CSV from "
-            "<a href='https://files.usaspending.gov/award_data_archive/' style='color:#89b4fa'>"
-            "files.usaspending.gov</a> and place in datasets/ before running."
+            "Builds dataset from <a href='https://sam.gov/' style='color:#89b4fa'>"
+            "SAM.gov</a> bulk CSV reports with multi-tier ticker resolution "
+            "(CAGE/UEI/EDGAR/fuzzy matching). Download reports to datasets/ folder."
         )
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
@@ -1509,12 +1509,13 @@ class TrainingDataTab(QWidget):
         stages_row.setSpacing(10)
 
         # Stage 1
-        s1 = QGroupBox("Stage 1 — Load & Filter")
+        s1 = QGroupBox("Stage 1 — Load & Filter (SAM.gov Bulk CSV)")
         s1l = QVBoxLayout(s1)
         self._s1_status = QLabel("Checking...")
         self._s1_status.setObjectName("status_missing")
         self._s1_status.setWordWrap(True)
-        s1l.addWidget(QLabel("Output: filtered_training_set.csv"))
+        s1l.addWidget(QLabel("Source: SAM.gov FirstReport.csv  |  Output: filtered_training_set.csv"))
+        s1l.addWidget(QLabel("Filters: $1M–$10B • Remove IDV/IDIQ • Top-20 companies"))
         s1l.addWidget(self._s1_status)
         self._btn_s1 = QPushButton("▶  Run Build (all stages)")
         self._btn_s1.setObjectName("run_btn")
@@ -1523,12 +1524,13 @@ class TrainingDataTab(QWidget):
         stages_row.addWidget(s1)
 
         # Stage 2
-        s2 = QGroupBox("Stage 2 — Resolve Tickers")
+        s2 = QGroupBox("Stage 2 — Resolve Tickers (TickerResolverV4)")
         s2l = QVBoxLayout(s2)
         self._s2_status = QLabel("Checking...")
         self._s2_status.setObjectName("status_missing")
         self._s2_status.setWordWrap(True)
         s2l.addWidget(QLabel("Output: stage2_with_tickers.csv"))
+        s2l.addWidget(QLabel("Tiers: CAGE→LEI→GLEIF • EDGAR exact/fuzzy • Substring • Sole-source"))
         s2l.addWidget(self._s2_status)
         self._btn_s2 = QPushButton("⟳  Resume Build")
         self._btn_s2.clicked.connect(lambda: self._run_build("build"))
@@ -1536,12 +1538,13 @@ class TrainingDataTab(QWidget):
         stages_row.addWidget(s2)
 
         # Stage 3
-        s3 = QGroupBox("Stage 3 — Enrich OHLC")
+        s3 = QGroupBox("Stage 3 — Enrich & Calculate Signals")
         s3l = QVBoxLayout(s3)
         self._s3_status = QLabel("Checking...")
         self._s3_status.setObjectName("status_missing")
         self._s3_status.setWordWrap(True)
         s3l.addWidget(QLabel("Output: training_set_final.csv"))
+        s3l.addWidget(QLabel("Data: OHLC prices • Shares outstanding • Historical mcap • 8-K filings"))
         s3l.addWidget(self._s3_status)
         self._btn_s3 = QPushButton("▶  Enrich OHLC")
         self._btn_s3.setObjectName("run_btn")

@@ -15,11 +15,11 @@ Stages 2–3 only process rows that pass each prior gate (ticker resolved).
 Checkpoints are saved in batches — interrupt and resume safely.
 
 Prerequisites:
-    Download the FY2023 contracts bulk file from:
-      https://files.usaspending.gov/award_data_archive/
-    Place the zip in datasets/
+    Set SAM_GOV_API_KEY environment variable with your sam.gov API key:
+      export SAM_GOV_API_KEY="your-api-key-here"
 
 Usage:
+    export SAM_GOV_API_KEY="your-key"
     python build_training_set.py [--quiet] [--verbose] [--json]
 """
 
@@ -35,7 +35,6 @@ import os
 import sys
 import time
 import warnings
-import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -158,21 +157,6 @@ def _read_csv(path: str) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 # STAGE 1 — LOAD & FILTER
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _find_bulk_file(year: int) -> str:
-    patterns = [
-        os.path.join(DATASET_DIR, f"FY{year}_All_Contracts_Full_*.zip"),
-        os.path.join(DATASET_DIR, f"FY{year}_All_Contracts_Full_*.csv"),
-        os.path.join(DATASET_DIR, f"FY{year}*Contracts*.zip"),
-        os.path.join(DATASET_DIR, f"FY{year}*Contract*.zip"),
-        os.path.join(DATASET_DIR, f"FY{year}*Contract*.csv"),
-    ]
-    for pat in patterns:
-        matches = sorted(glob.glob(pat))
-        if matches:
-            return matches[-1]
-    return ""
-
 
 def _parse_bulk_row(row: dict, month_filter: int = 0) -> tuple | None:
     """Parse one CSV row → (award_key, award_dict) or None to discard.

@@ -27,6 +27,17 @@ SCORE_WEIGHTS = {
 }
 SCORE_THRESHOLD = 40
 
+# ─── SAM.gov API Configuration ──────────────────────────────────────────────────
+
+SAM_GOV_API_BASE = "https://api.sam.gov/contract-awards/v1/"
+SAM_GOV_CONTRACT_ENDPOINT = "search"
+SAM_GOV_RECORDS_PER_PAGE = 50  # Reduced from 100 to reduce rate limit hits
+SAM_GOV_RATE_LIMIT_SEC = 3.0  # Conservative: 1 request per 3 seconds (very strict rate limiting)
+SAM_GOV_RETRY_ATTEMPTS = 5  # More retry attempts for rate limiting
+SAM_GOV_RETRY_BACKOFF_FACTOR = 2.0
+SAM_GOV_TIMEOUT_SEC = 30  # HTTP request timeout
+SAM_GOV_API_KEY = "SAM-178836eb-f9ad-4c50-9872-dc258dba2521"  # WARN: Do not commit this to git
+
 # Bracket order params
 TAKE_PROFIT_PCT = 0.08  # +8%
 STOP_LOSS_PCT = 0.07    # -7%

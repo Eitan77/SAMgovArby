@@ -50,17 +50,22 @@ MAX_AWARD_AMOUNT = 10_000_000_000
 def _build_funnel_breakdown(all_results, training_csv=None):
     """Build a complete funnel breakdown from Stage 1 (raw CSV) through backtest.
 
+    Reads stage1/stage2 checkpoint files (fast) instead of re-scanning the FY CSV.
     Returns dict with counts at each filtering stage.
-    If Stage 1 data (FY2023 CSV) is not available, shows only backtest-stage breakdown.
     """
     breakdown = {
-        "stage1_total": 0,
-        "stage1_idiq": 0,
+        # Stage 1 — raw load & filter
+        "raw_rows_read": 0,
+        "after_dedup_amount": 0,
         "stage1_top20": 0,
-        "stage1_value_range": 0,
-        "stage2_after_build": 0,
-        "stage3_ticker_failed": 0,
+        "stage1_idiq": 0,
+        "stage1_total": 0,        # final count after all stage1 filters
+        # Stage 2 — ticker resolution
+        "stage2_ticker_resolved": 0,
+        "stage2_ticker_failed": 0,
+        # Stage 3 — enriched training CSV
         "stage3_after_enrich": 0,
+        # Backtest filters
         "backtest_market_cap": 0,
         "backtest_8k": 0,
         "backtest_dilutive": 0,
@@ -71,64 +76,46 @@ def _build_funnel_breakdown(all_results, training_csv=None):
         "traded": 0,
     }
 
-    # Attempt to load Stage 1 counts from raw FY2023 CSV
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cp_dir = os.path.join(script_dir, "datasets", "checkpoints")
+
+    # Stage 1 — read from checkpoint (instant, no FY CSV needed)
     try:
-        fy_files = glob.glob(os.path.join("datasets", "FY2023*Contracts*.zip"))
-        if not fy_files:
-            fy_files = glob.glob(os.path.join("datasets", "FY*Contracts*.csv"))
-
-        if fy_files:
-            csv_file = fy_files[0]
-            log.debug(f"Loading raw FY2023 for Stage 1 counts: {csv_file}")
-
-            # Use polars for speed
-            try:
-                df = pl.read_csv(csv_file, infer_schema_length=1000)
-            except:
-                # Try with encoding
-                df = pl.read_csv(csv_file, encoding="latin-1", infer_schema_length=1000)
-
-            total = len(df)
-            breakdown["stage1_total"] = total
-
-            # Count IDIQ
-            idiq_col = next((c for c in df.columns if "idiq" in c.lower()), None)
-            if idiq_col:
-                breakdown["stage1_idiq"] = df.filter(pl.col(idiq_col) == True).height
-
-            # Count top-20 awardees
-            awardee_col = next((c for c in df.columns if "awardee" in c.lower()), None)
-            if awardee_col:
-                top20 = df.group_by(awardee_col).agg(pl.count().alias("cnt")).sort("cnt", descending=True).head(20)
-                top20_names = set(top20.select(awardee_col).to_series())
-                breakdown["stage1_top20"] = df.filter(pl.col(awardee_col).is_in(top20_names)).height
-
-            # Count value range (outside $1M-$10B)
-            amount_col = next((c for c in df.columns if "amount" in c.lower()), None)
-            if amount_col:
-                outside_range = df.filter(
-                    (pl.col(amount_col) < MIN_CONTRACT_VALUE) | (pl.col(amount_col) > MAX_AWARD_AMOUNT)
-                ).height
-                breakdown["stage1_value_range"] = outside_range
-        else:
-            log.debug("No FY2023 CSV found in datasets/, skipping Stage 1 counts")
+        cp1_path = os.path.join(cp_dir, "stage1_filter.json")
+        if os.path.exists(cp1_path):
+            with open(cp1_path) as f:
+                cp1 = _json.load(f)
+            breakdown["raw_rows_read"]      = cp1.get("total_rows_read", 0)
+            breakdown["after_dedup_amount"] = cp1.get("unique_after_dedup_and_amount_filter", 0)
+            breakdown["stage1_top20"]       = cp1.get("dropped_top20", 0)
+            breakdown["stage1_idiq"]        = cp1.get("dropped_idiq", 0)
+            breakdown["stage1_total"]       = cp1.get("final_count", 0)
+            log.debug(f"Stage 1 checkpoint loaded: {breakdown['stage1_total']:,} contracts after filters")
     except Exception as e:
-        log.debug(f"Could not load Stage 1 counts: {e}")
+        log.debug(f"Could not load stage1 checkpoint: {e}")
 
-    # Stage 2/3 estimates from training CSV row count
+    # Stage 2 — count resolved vs unresolved from checkpoint
+    try:
+        cp2_path = os.path.join(cp_dir, "stage2_tickers.json")
+        if os.path.exists(cp2_path):
+            with open(cp2_path) as f:
+                cp2 = _json.load(f)
+            resolved   = sum(1 for v in cp2.values() if isinstance(v, dict) and v.get("ticker"))
+            unresolved = sum(1 for v in cp2.values() if isinstance(v, dict) and not v.get("ticker"))
+            breakdown["stage2_ticker_resolved"] = resolved
+            breakdown["stage2_ticker_failed"]   = unresolved
+            log.debug(f"Stage 2 checkpoint loaded: {resolved:,} resolved, {unresolved:,} unresolved")
+    except Exception as e:
+        log.debug(f"Could not load stage2 checkpoint: {e}")
+
+    # Stage 3 — count rows in training CSV
     if training_csv and os.path.exists(training_csv):
         try:
             with open(training_csv) as f:
                 training_rows = sum(1 for _ in f) - 1  # Exclude header
             breakdown["stage3_after_enrich"] = training_rows
-
-            # Estimate Stage 2 (before enrichment) by assuming small loss
-            if breakdown["stage1_total"] > 0:
-                stage1_after_filters = breakdown["stage1_total"] - breakdown["stage1_idiq"] - breakdown["stage1_top20"] - breakdown["stage1_value_range"]
-                breakdown["stage2_after_build"] = stage1_after_filters
-                breakdown["stage3_ticker_failed"] = max(0, stage1_after_filters - training_rows)
         except Exception as e:
-            log.debug(f"Could not load training CSV for Stage 2/3 counts: {e}")
+            log.debug(f"Could not count training CSV rows: {e}")
 
     # Count backtest filter removals from all_results
     for result in all_results:
@@ -146,17 +133,14 @@ def _build_funnel_breakdown(all_results, training_csv=None):
         elif fr == "duplicate":
             breakdown["backtest_duplicate"] += 1
         elif fr == "fail":
-            # Parse failure reason to subcategorize
             if re.search(r"market cap.*exceeds", reason, re.I):
                 breakdown["backtest_market_cap"] += 1
             elif re.search(r"8-K filed", reason, re.I):
                 breakdown["backtest_8k"] += 1
             elif re.search(r"dilutive", reason, re.I):
                 breakdown["backtest_dilutive"] += 1
-            # Other "fail" reasons (IDIQ, value range) are from training build
 
     return breakdown
-
 
 def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
                  tp: float = TAKE_PROFIT_PCT, sl: float = STOP_LOSS_PCT,

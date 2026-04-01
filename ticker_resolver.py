@@ -1,13 +1,14 @@
 """Multi-stage ticker resolver for SAM.gov awardee names.
 
 Strategy:
+  0. Non-public entity detection (universities, gov agencies, non-profits)
   1. Exact / normalized match against local EDGAR company_tickers map
   2. Validate candidate via SEC submissions (current name + former names)
-  3. Fuzzy match (≥85%) + validation
-  4. Non-public entity detection (universities, gov agencies, non-profits)
+  3. Substring match (catch subsidiaries like "NORTHROP GRUMMAN SYSTEMS CORP")
+  4. Fuzzy match (≥80-85%) + validation
+  5. Parent company escalation (use USASpending parent_recipient_name)
 
-Only accepts high-confidence matches. Unresolved entities are marked as such
-rather than guessed.
+Uses sec-cik-mapper for broader EDGAR coverage (~10K+ tickers vs ~8K).
 """
 import json
 import logging
@@ -60,7 +61,10 @@ _SUFFIX_WORDS = {
     "INC", "INCORPORATED", "CORP", "CORPORATION", "LLC", "LLP",
     "LTD", "LIMITED", "CO", "COMPANY", "LP", "HOLDINGS",
     "GROUP", "TECHNOLOGIES", "SOLUTIONS", "SYSTEMS", "SERVICES",
-    "ENTERPRISES", "INTERNATIONAL", "GLOBAL", "USA", "US", "DBA",
+    "ENTERPRISES", "GLOBAL", "USA", "US", "DBA",
+    # State of incorporation suffixes from SEC EDGAR names
+    "DE", "MD", "NV", "NY", "VA", "CA", "TX", "FL", "PA", "OH",
+    "WA", "GA", "MA", "IL", "NJ", "CT", "AZ", "CO", "MN",
 }
 
 # SEC EDGAR endpoints
@@ -167,14 +171,17 @@ _EDGAR_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
 
 def _load_edgar_map_default() -> dict:
-    """Load the EDGAR company→ticker map from local cache or SEC download."""
+    """Load the EDGAR company→ticker map from local cache or sec-cik-mapper.
+
+    Uses sec-cik-mapper (13K+ entries) as primary source, falls back to
+    SEC company_tickers.json download if unavailable.
+    """
     if os.path.exists(_EDGAR_MAP_FILE):
         age_days = (time.time() - os.path.getmtime(_EDGAR_MAP_FILE)) / 86400
         if age_days < 7:
             try:
                 with open(_EDGAR_MAP_FILE) as f:
                     data = json.load(f)
-                # Migrate legacy string-ticker format to dict format
                 migrated = {}
                 for name, val in data.items():
                     if isinstance(val, str):
@@ -185,6 +192,25 @@ def _load_edgar_map_default() -> dict:
             except Exception as e:
                 log.warning(f"Could not load EDGAR map from cache: {e}")
 
+    # Primary: sec-cik-mapper (broader coverage)
+    try:
+        from sec_cik_mapper import StockMapper
+        mapper = StockMapper()
+        edgar_map = {}
+        for ticker, name in mapper.ticker_to_company_name.items():
+            cik = str(mapper.ticker_to_cik.get(ticker, ""))
+            name_upper = name.strip().upper()
+            ticker_upper = ticker.strip().upper()
+            if name_upper and ticker_upper:
+                edgar_map[name_upper] = {"ticker": ticker_upper, "cik": cik}
+        with open(_EDGAR_MAP_FILE, "w") as f:
+            json.dump(edgar_map, f)
+        log.info(f"EDGAR map via sec-cik-mapper: {len(edgar_map):,} companies")
+        return edgar_map
+    except Exception as e:
+        log.warning(f"sec-cik-mapper failed ({e}), falling back to SEC download")
+
+    # Fallback: direct SEC download
     log.info("Downloading EDGAR company tickers from SEC...")
     try:
         resp = requests.get(_EDGAR_TICKERS_URL, headers=EDGAR_HEADERS, timeout=30)
@@ -235,6 +261,14 @@ class TickerResolverV2:
         # Pre-build list for fuzzy matching
         self._edgar_names = list(edgar_map.keys())
 
+        # Pre-build substring index: stripped name → (original_name, entry)
+        # Only names with ≥2 words (to avoid false positives on "APPLE", "ORACLE" etc.)
+        self._substr_candidates: list[tuple[str, str, dict]] = []
+        for ename, entry in edgar_map.items():
+            s = _strip_suffixes(_normalize(ename))
+            if s and len(s.split()) >= 2:
+                self._substr_candidates.append((s, ename, entry))
+
     def _load_cache(self):
         if os.path.exists(self.cache_path):
             try:
@@ -265,8 +299,12 @@ class TickerResolverV2:
         with open(self.mcap_cache_path, "w") as f:
             json.dump(self.mcap_cache, f, indent=2)
 
-    def resolve(self, awardee_name: str) -> dict:
+    def resolve(self, awardee_name: str, parent_name: str = "") -> dict:
         """Resolve an awardee name to ticker/CIK.
+
+        Args:
+            awardee_name: Direct company name from award
+            parent_name: Parent company name from USASpending (fallback)
 
         Returns cache entry dict with keys: resolved_ticker, resolved_cik,
         evidence_type, confidence, rejection_reason, market_cap_current.
@@ -274,20 +312,41 @@ class TickerResolverV2:
         if awardee_name in self.cache:
             return self.cache[awardee_name]
 
+        result = self._resolve_name(awardee_name)
+        if result.get("resolved_ticker"):
+            self.cache[awardee_name] = result
+            return result
+
+        # Stage 5: parent company escalation
+        if parent_name and parent_name.strip().upper() != awardee_name.strip().upper():
+            parent_result = self._resolve_name(parent_name)
+            if parent_result.get("resolved_ticker"):
+                # Re-tag evidence to show this came via parent escalation
+                parent_result["evidence_type"] = f"parent_{parent_result['evidence_type']}"
+                parent_result["original_name"] = awardee_name
+                self.cache[awardee_name] = parent_result
+                return parent_result
+
+        # No match found
         norm = _normalize(awardee_name)
+        result = self._make_result(awardee_name, norm, None, None, "none", "unresolved", "no_match")
+        self.cache[awardee_name] = result
+        return result
+
+    def _resolve_name(self, name: str) -> dict:
+        """Core resolution logic for a single name (no parent escalation)."""
+        norm = _normalize(name)
         stripped = _strip_suffixes(norm)
 
-        # Stage 4 first (cheap): non-public entity detection
+        # Stage 0 (cheap): non-public entity detection
         for pat in _NON_PUBLIC_RE:
-            if pat.search(awardee_name):
-                result = self._make_result(awardee_name, norm, None, None,
-                                           "none", "unresolved", "non_public_entity")
-                self.cache[awardee_name] = result
-                return result
+            if pat.search(name):
+                return self._make_result(name, norm, None, None,
+                                         "none", "unresolved", "non_public_entity")
 
         # Stage 1: exact match against EDGAR map
         candidate = None
-        for key in [awardee_name.strip().upper(), norm, stripped]:
+        for key in [name.strip().upper(), norm, stripped]:
             if key in self.edgar_map:
                 candidate = self.edgar_map[key]
                 break
@@ -301,49 +360,85 @@ class TickerResolverV2:
                 valid, confidence, evidence = _validate_candidate(cik, norm, stripped)
                 if valid:
                     mc = self._get_market_cap(candidate["ticker"])
-                    result = self._make_result(awardee_name, norm, candidate["ticker"],
-                                               cik, confidence, evidence, None, mc)
-                    self.cache[awardee_name] = result
-                    return result
+                    return self._make_result(name, norm, candidate["ticker"],
+                                             cik, confidence, evidence, None, mc)
             else:
-                # No CIK in EDGAR map, do yfinance verification
                 mc = self._get_market_cap(candidate["ticker"])
                 if mc > 0:
-                    result = self._make_result(awardee_name, norm, candidate["ticker"],
-                                               "", "medium", "exact_edgar_map_unverified", None, mc)
-                    self.cache[awardee_name] = result
-                    return result
+                    return self._make_result(name, norm, candidate["ticker"],
+                                             "", "medium", "exact_edgar_map_unverified", None, mc)
 
-        # Stage 3: fuzzy match + validate
+        # Stage 3: substring match (catch subsidiaries)
+        sub_result = self._substring_match(name, norm, stripped)
+        if sub_result:
+            return sub_result
+
+        # Stage 4: fuzzy match + validate
+        # Lower threshold for short names (≤3 words are more sensitive)
+        min_score = 80 if len(stripped.split()) <= 3 else 85
         results = process.extract(norm, self._edgar_names, scorer=fuzz.token_sort_ratio, limit=5)
         for match_name, score, _ in results:
-            if score < 85:
+            if score < min_score:
                 break
             entry = self.edgar_map[match_name]
             cik = entry.get("cik", "")
 
             if score >= 95:
-                # Very high similarity — accept with medium confidence even without CIK validation
                 mc = self._get_market_cap(entry["ticker"])
                 if mc > 0:
-                    result = self._make_result(awardee_name, norm, entry["ticker"],
-                                               cik, "medium_high", "fuzzy_very_high", None, mc)
-                    self.cache[awardee_name] = result
-                    return result
+                    return self._make_result(name, norm, entry["ticker"],
+                                             cik, "medium_high", "fuzzy_very_high", None, mc)
 
             if cik:
                 valid, confidence, evidence = _validate_candidate(cik, norm, stripped)
                 if valid:
                     mc = self._get_market_cap(entry["ticker"])
-                    result = self._make_result(awardee_name, norm, entry["ticker"],
-                                               cik, confidence, f"fuzzy_{evidence}", None, mc)
-                    self.cache[awardee_name] = result
-                    return result
+                    return self._make_result(name, norm, entry["ticker"],
+                                             cik, confidence, f"fuzzy_{evidence}", None, mc)
 
-        # No match found
-        result = self._make_result(awardee_name, norm, None, None, "none", "unresolved", "no_match")
-        self.cache[awardee_name] = result
-        return result
+        # No match
+        return self._make_result(name, norm, None, None, "none", "unresolved", "no_match")
+
+    def _substring_match(self, original: str, norm: str, stripped: str) -> dict | None:
+        """Check if an EDGAR company name is a significant substring of the awardee name.
+
+        Catches cases like "NORTHROP GRUMMAN SYSTEMS CORP" → "NORTHROP GRUMMAN"
+        """
+        best_match = None
+        best_len = 0
+        for edgar_stripped, edgar_orig, entry in self._substr_candidates:
+            # Check both directions:
+            # 1. EDGAR name contained in awardee: "NORTHROP GRUMMAN" in "NORTHROP GRUMMAN SYSTEMS"
+            # 2. Awardee contained in EDGAR name: "NORTHROP GRUMMAN" in "NORTHROP GRUMMAN CORP DE"
+            match_len = 0
+            if edgar_stripped in stripped:
+                match_len = len(edgar_stripped)
+            elif stripped in edgar_stripped:
+                match_len = len(stripped)
+            if match_len > best_len:
+                best_match = (edgar_stripped, edgar_orig, entry)
+                best_len = match_len
+
+        if not best_match or best_len < 10:  # min 10 chars to avoid false positives
+            return None
+
+        edgar_stripped, edgar_orig, entry = best_match
+        cik = entry.get("cik", "")
+
+        # For substring matches, we validate that the ticker is real (has mcap)
+        # rather than requiring the SEC name to match the awardee name exactly
+        # (they won't match — that's the whole point of substring matching).
+        # Extra safety: require the overlap to be ≥60% of the longer name.
+        longer = max(len(stripped), len(edgar_stripped))
+        overlap_pct = best_len / longer if longer else 0
+        if overlap_pct < 0.6:
+            return None
+
+        mc = self._get_market_cap(entry["ticker"])
+        if mc > 0:
+            return self._make_result(original, norm, entry["ticker"],
+                                     cik, "medium", "substring_match", None, mc)
+        return None
 
     def _get_market_cap(self, ticker: str) -> float:
         """Get market cap for ticker, using persistent cache to minimize API calls."""
