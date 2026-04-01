@@ -1162,6 +1162,11 @@ class BacktestTab(QWidget):
         stats = _summary_stats(rows)
         breakdown = self._load_breakdown()
 
+        # Reconcile breakdown traded count from CSV (single source of truth)
+        if breakdown and rows:
+            csv_traded = sum(1 for r in rows if r.get("filter_result") == "pass")
+            breakdown["traded"] = csv_traded
+
         # Update summary panel
         # Clear old widgets
         while self._summary_lay.count():
@@ -1224,7 +1229,7 @@ class BacktestTab(QWidget):
             for label, value, color in [
                 ("Sharpe Ratio",    f"{stats['sharpe_ratio']:.2f}",         "#a6e3a1" if stats["sharpe_ratio"] > 1 else "#f38ba8"),
                 ("Profit Factor",   f"{stats['profit_factor']:.2f}x",       "#a6e3a1" if stats["profit_factor"] > 1 else "#f38ba8"),
-                ("Max Drawdown",    f"{stats['max_drawdown']:+.2f}%",       "#f38ba8"),
+                ("Max Drawdown",    f"-{stats['max_drawdown']:.2f}%",        "#f38ba8"),
                 ("Expectancy",      f"{stats['expectancy']:+.2f}%",         "#a6e3a1" if stats["expectancy"] >= 0 else "#f38ba8"),
             ]:
                 card = _make_stat_card(label, value, color)
@@ -1260,13 +1265,14 @@ class BacktestTab(QWidget):
             ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._breakdown_lay.addWidget(ph)
 
-        # Update chart
-        pnl_values = [float(r.get("pnl_pct", 0)) for r in rows
-                      if r.get("pnl_pct") not in ("", None)]
-        try:
-            pnl_values = [float(v) for v in pnl_values]
-        except Exception:
-            pnl_values = []
+        # Update chart — only include actual passed trades
+        pnl_values = []
+        for r in rows:
+            if r.get("filter_result") == "pass" and r.get("pnl_pct") not in ("", None):
+                try:
+                    pnl_values.append(float(r["pnl_pct"]))
+                except (ValueError, TypeError):
+                    pass
         if pnl_values:
             self._canvas.plot_cumulative_pnl(pnl_values)
         else:
@@ -1310,6 +1316,21 @@ class BacktestTab(QWidget):
 
         stage3_enriched = breakdown.get("stage3_after_enrich", 0)
 
+        # Compute totals for backtest filter stage
+        traded = breakdown.get("traded", 0)
+        bt_removals = (
+            breakdown.get("backtest_low_confidence", 0)
+            + breakdown.get("backtest_market_cap", 0)
+            + breakdown.get("backtest_8k", 0)
+            + breakdown.get("backtest_dilutive", 0)
+            + breakdown.get("backtest_low_score", 0)
+            + breakdown.get("backtest_no_ticker", 0)
+            + breakdown.get("backtest_no_price", 0)
+            + breakdown.get("backtest_duplicate", 0)
+        )
+        # Use actual rows processed if available, otherwise derive from traded + removals
+        bt_input = breakdown.get("backtest_rows_processed", traded + bt_removals)
+
         # Build complete funnel
         items = [
             ("📥 Raw Records (FirstReport.csv)", raw, None),
@@ -1318,7 +1339,7 @@ class BacktestTab(QWidget):
             ("  └─ Stage 2: Resolve Tickers", breakdown.get("stage2_ticker_resolved", 0), "#89b4fa"),
             ("    └─ Removed: Ticker Failed", breakdown.get("stage2_ticker_failed", 0), None),
             ("  └─ Stage 3: Enrich Signals", breakdown.get("stage3_after_enrich", 0), "#89b4fa"),
-            ("  └─ Backtest: Apply Filters", breakdown.get("stage3_after_enrich", 0) - breakdown.get("backtest_market_cap", 0) - breakdown.get("backtest_low_score", 0) - breakdown.get("backtest_8k", 0) - breakdown.get("backtest_dilutive", 0) - breakdown.get("backtest_no_ticker", 0) - breakdown.get("backtest_no_price", 0) - breakdown.get("backtest_duplicate", 0) - breakdown.get("backtest_low_confidence", 0), "#89b4fa"),
+            ("  └─ Backtest: Apply Filters", bt_input, "#89b4fa"),
             ("    ├─ Removed: Ticker Confidence", breakdown.get("backtest_low_confidence", 0), None),
             ("    ├─ Removed: Market Cap > $500M", breakdown.get("backtest_market_cap", 0), None),
             ("    ├─ Removed: 8-K Filed < 2d", breakdown.get("backtest_8k", 0), None),
@@ -1327,7 +1348,7 @@ class BacktestTab(QWidget):
             ("    ├─ Removed: No Ticker", breakdown.get("backtest_no_ticker", 0), None),
             ("    ├─ Removed: No Price Data", breakdown.get("backtest_no_price", 0), None),
             ("    └─ Removed: Duplicate", breakdown.get("backtest_duplicate", 0), None),
-            ("✅ FINAL TRADES FIRED", breakdown.get("traded", 0), "#a6e3a1"),
+            ("✅ FINAL TRADES FIRED", traded, "#a6e3a1"),
         ]
 
         for label, count, color in items:

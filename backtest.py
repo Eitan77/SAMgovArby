@@ -133,6 +133,10 @@ def _build_funnel_breakdown(all_results, training_csv=None):
                 # Catch-all for other fail reasons
                 breakdown["backtest_low_confidence"] += 1
 
+    # Record actual rows processed by backtest (may differ from stage3 due to
+    # date range filter or max_records limit)
+    breakdown["backtest_rows_processed"] = len(all_results)
+
     return breakdown
 
 def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
