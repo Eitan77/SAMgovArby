@@ -1,36 +1,26 @@
-"""Backtest runner: replay historical SAM.gov awards through the full pipeline.
+"""Backtest runner: replay historical SAM.gov awards through the training CSV pipeline.
 
 Usage:
-    python backtest.py --start 2023-01-01 --end 2023-12-31 [--quiet] [--verbose]
-    python backtest.py --start 2022-01-01 --end 2024-01-01 --max-records 2000 [--quiet]
+    python backtest.py --start 2023-01-01 --end 2023-12-31 --training-csv datasets/training_set_final.csv
+    python backtest.py --start 2023-01-01 --end 2023-12-31 --training-csv datasets/training_set_final.csv --quiet
 """
 import argparse
 import csv
-import glob
 import json as _json
 import logging
 import os
 import re
-import sys
 import time
-from datetime import datetime
-
-import polars as pl
 
 from config_logging import setup_logging, add_verbosity_flags
-from usaspending_poller import fetch_awards_range
-from historical_poller import date_range_chunks
-from watchlist_poller import fetch_awards_for_watchlist
-from filter_engine_bt import apply_filters_bt, apply_filters_bt_from_training
+from filter_engine_bt import apply_filters_bt_from_training
 from scoring_engine import score_contract
-from ticker_resolver import resolve_ticker
-from price_sim import simulate_trade, simulate_trade_from_row, get_historical_market_cap
-from award_cache import load_from_cache, save_to_cache
+from price_sim import simulate_trade_from_row
 from config import SCORE_THRESHOLD, TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_DAYS
 
 log = logging.getLogger("backtest")
 
-RESULTS_FILE = os.path.join(os.path.dirname(__file__), "backtest_results.csv")  # Overridden by run_backtest with year-specific name
+RESULTS_FILE = os.path.join(os.path.dirname(__file__), "backtest_results.csv")
 RESULTS_DETAILED_FILE = os.path.join(os.path.dirname(__file__), "backtest_results_detailed.csv")
 RESULTS_FIELDS = [
     "award_date", "awardee_name", "agency", "award_amount", "naics",
@@ -42,9 +32,6 @@ RESULTS_FIELDS = [
     "exit_reason", "pnl_pct", "hit_tp", "hit_sl", "timed_out",
     "tp_target", "sl_target", "return_t7", "peak_pnl_pct",
 ]
-
-MIN_CONTRACT_VALUE = 1_000_000
-MAX_AWARD_AMOUNT = 10_000_000_000
 
 
 def _build_funnel_breakdown(all_results, training_csv=None):
@@ -145,20 +132,21 @@ def _build_funnel_breakdown(all_results, training_csv=None):
 def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
                  tp: float = TAKE_PROFIT_PCT, sl: float = STOP_LOSS_PCT,
                  hold: int = MAX_HOLD_DAYS, threshold: int = SCORE_THRESHOLD,
-                 output_file: str = RESULTS_FILE, use_cache: bool = True,
-                 watchlist_mode: bool = False,
-                 dataset_file: str = None,
+                 output_file: str = RESULTS_FILE,
                  training_csv: str = None,
                  max_market_cap: int = None):
-    """Run a full backtest and write results CSV. Returns summary stats dict.
+    """Run a backtest from the pre-built training CSV. Returns (stats, breakdown, all_results).
 
-    If training_csv is provided, uses the pre-built training CSV with historical
-    signals (8-K, press release, historical market cap) for accurate backtesting.
-    If max_market_cap is provided, overrides config.MAX_MARKET_CAP for this run.
+    training_csv: path to training_set_final.csv from build_training_set.py (required).
+    max_market_cap: overrides config.MAX_MARKET_CAP for this run.
     """
-    import config as config_module
+    if not training_csv:
+        raise ValueError(
+            "training_csv is required. Build it first with: python build_training_set.py\n"
+            "Then pass: --training-csv datasets/training_set_final.csv"
+        )
 
-    # Override max_market_cap if provided
+    import config as config_module
     old_max_market_cap = None
     if max_market_cap is not None:
         old_max_market_cap = config_module.MAX_MARKET_CAP
@@ -168,175 +156,15 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
     log.info(f"Backtest: {start_date} -> {end_date} | "
              f"TP={tp*100:.0f}% SL={sl*100:.0f}% Hold={hold}d Threshold={threshold}{mcap_str}")
 
-    # Training CSV mode: use historical data for all signals
-    if training_csv:
-        result = _run_backtest_from_training(
-            training_csv, start_date, end_date, max_records,
-            tp, sl, hold, threshold, output_file, max_market_cap
-        )
-        if old_max_market_cap is not None:
-            config_module.MAX_MARKET_CAP = old_max_market_cap
-        return result
+    result = _run_backtest_from_training(
+        training_csv, start_date, end_date, max_records,
+        tp, sl, hold, threshold, output_file, max_market_cap
+    )
 
-    all_results = []
-    total_fetched = 0
-
-    import json as _json
-    awards = []
-
-    if dataset_file:
-        # Fastest path: pre-built dataset, no API calls
-        log.info(f"Loading pre-built dataset: {dataset_file}")
-        with open(dataset_file) as f:
-            awards = _json.load(f)
-        log.info(f"Loaded {len(awards)} awards from dataset")
-    elif use_cache:
-        cached = load_from_cache(start_date, end_date)
-        if cached:
-            awards = cached
-            total_fetched = len(awards)
-
-    if not awards and not dataset_file:
-        if watchlist_mode:
-            log.info("Watchlist mode: fetching awards for known small-cap defense stocks")
-            awards = fetch_awards_for_watchlist(start_date, end_date)
-        else:
-            log.info(f"Fetching {start_date} -> {end_date} from USASpending.gov")
-            awards = fetch_awards_range(start_date, end_date, max_records=max_records)
-        total_fetched = len(awards)
-        if use_cache:
-            save_to_cache(awards, start_date, end_date)
-
-    # Process awards (runs whether from cache or fresh fetch)
-    ticker_cache = {}  # in-memory cache: company_name -> (ticker, market_cap, edgar_results)
-    total_to_process = min(len(awards), max_records)
-    signals = 0
-    filtered = 0
-    seen_trades = set()  # (ticker, date) dedup
-    t_start = time.time()
-
-    log.info(f"Processing {total_to_process} awards... (updates every 10)")
-    for i, contract in enumerate(awards[:max_records]):
-        result = _process_contract(contract, tp, sl, hold, threshold, ticker_cache)
-
-        # Deduplicate: only one trade per ticker per day
-        if result.get("filter_result") == "pass" and result.get("ticker"):
-            key = (result["ticker"], result.get("award_date", "")[:10])
-            if key in seen_trades:
-                result["filter_result"] = "duplicate"
-                result["filter_reason"] = f"Duplicate trade for {key[0]} on {key[1]}"
-                for fld in ("entry_price", "exit_price", "pnl_pct", "entry_date",
-                            "exit_date", "exit_reason", "hit_tp", "hit_sl", "timed_out"):
-                    result.pop(fld, None)
-            else:
-                seen_trades.add(key)
-
-        all_results.append(result)
-
-        fr = result.get("filter_result", "")
-        if fr == "pass":
-            signals += 1
-        else:
-            filtered += 1
-
-        if (i + 1) % 10 == 0:
-            elapsed = time.time() - t_start
-            rate = elapsed / (i + 1)
-            remaining = rate * (total_to_process - i - 1)
-            mins, secs = divmod(int(remaining), 60)
-            log.info(
-                f"  [{i+1}/{total_to_process}] "
-                f"signals={signals} filtered={filtered} | "
-                f"~{mins}m{secs:02d}s remaining | "
-                f"last: {contract['awardee_name'][:35]} -> {fr}"
-            )
-
-    # Write CSV
-    _write_results(all_results, output_file)
-
-    # Compute stats on traded contracts only
-    traded = [r for r in all_results if r.get("entry_price")]
-    stats = _compute_stats(traded, tp, sl)
-    _print_report(stats, all_results, traded, start_date, end_date)
-
-    # Build funnel breakdown and save to JSON for GUI
-    breakdown = _build_funnel_breakdown(all_results, training_csv=None)
-    breakdown_file = os.path.join(os.path.dirname(__file__), "backtest_breakdown_2023.json")
-    with open(breakdown_file, "w") as f:
-        _json.dump(breakdown, f)
-
-    # Restore original max_market_cap if it was overridden
     if old_max_market_cap is not None:
         config_module.MAX_MARKET_CAP = old_max_market_cap
 
-    return stats, breakdown, all_results
-
-
-def _process_contract(contract, tp, sl, hold, threshold, ticker_cache=None):
-    """Run one contract through filter -> score -> resolve -> simulate."""
-    base = {
-        "award_date": contract.get("posted_date", ""),
-        "awardee_name": contract["awardee_name"],
-        "agency": contract["agency"],
-        "award_amount": contract["award_amount"],
-        "naics": contract["naics"],
-        "sole_source": contract["sole_source"],
-    }
-
-    # Filter (backtest-safe version — no news/8-K checks)
-    passed, reason, extra = apply_filters_bt(contract, ticker_cache=ticker_cache)
-    base["filter_result"] = "pass" if passed else "fail"
-    base["filter_reason"] = reason
-
-    if not passed:
-        return base
-
-    # Score — use historical market cap when available
-    market_cap = extra.get("market_cap", 0)
-    if not market_cap and extra.get("ticker"):
-        market_cap = get_historical_market_cap(
-            extra["ticker"], contract.get("posted_date", ""))
-        extra["market_cap"] = market_cap
-
-    # agency_prior_win_count is not available in non-training mode; 0 → first win
-    # but we don't have full history here so leave is_first_agency_win=None
-    # (scores 0 pts conservatively — consistent with live mode)
-    score, breakdown = score_contract(contract, market_cap, threshold=threshold)
-    base["score"] = score
-    base["market_cap"] = round(market_cap)
-    base["value_to_mcap_pct"] = breakdown.get("value_to_mcap", {}).get("ratio", 0)
-
-    log.info(f"Score {score}/100 | mcap=${market_cap:,.0f} | {contract['awardee_name'][:40]} | Pass={score >= threshold}")
-
-    if score < threshold:
-        base["filter_result"] = "low_score"
-        base["filter_reason"] = f"Score {score} < threshold {threshold}"
-        return base
-
-    # Resolve ticker
-    ticker = extra.get("ticker")
-    if not ticker:
-        ticker, confidence = resolve_ticker(
-            contract["awardee_name"],
-            edgar_results=extra.get("edgar_results"),
-        )
-
-    base["ticker"] = ticker or ""
-    if not ticker:
-        base["filter_result"] = "no_ticker"
-        base["filter_reason"] = "Ticker resolution failed"
-        return base
-
-    # Simulate price action
-    award_date = contract.get("posted_date", "")[:10]
-    sim = simulate_trade(ticker, award_date, tp, sl, hold)
-    if sim:
-        base.update({k: sim[k] for k in sim if k != "ticker"})
-    else:
-        base["filter_result"] = "no_price_data"
-        base["filter_reason"] = "Price data unavailable"
-
-    return base
+    return result
 
 
 def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
@@ -350,8 +178,23 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
         rows = list(reader)
     log.info(f"Loaded {len(rows)} rows from training CSV")
 
-    # Filter by date range
-    rows = [r for r in rows if start_date <= r.get("posted_date", "")[:10] <= end_date]
+    # Filter by date range (normalize posted_date from M/D/YYYY to YYYY-MM-DD)
+    def normalize_date(date_str: str) -> str:
+        if not date_str:
+            return ""
+        date_str = date_str.strip()
+        if len(date_str) >= 10 and date_str[4] == '-':
+            return date_str[:10]  # Already YYYY-MM-DD
+        try:
+            parts = date_str.split('/')
+            if len(parts) == 3:
+                m, d, y = parts
+                return f"{y}-{int(m):02d}-{int(d):02d}"
+        except (ValueError, IndexError):
+            pass
+        return date_str[:10]
+
+    rows = [r for r in rows if start_date <= normalize_date(r.get("posted_date", "")) <= end_date]
     log.info(f"{len(rows)} rows within date range {start_date} -> {end_date}")
 
     all_results = []
@@ -687,9 +530,6 @@ if __name__ == "__main__":
         sl=args.sl,
         hold=args.hold,
         threshold=args.threshold,
-        use_cache=not args.no_cache,
-        watchlist_mode=args.watchlist,
-        dataset_file=args.dataset,
         training_csv=args.training_csv,
         output_file=year_specific_output,
         max_market_cap=args.max_market_cap,

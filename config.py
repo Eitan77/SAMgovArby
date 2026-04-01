@@ -14,9 +14,6 @@ MAX_MARKET_CAP = 5_000_000_000  # $5B (wide net — optimizer tunes the real cut
 MIN_CONTRACT_VALUE = 1_000_000  # $1M
 MAX_AWARD_AMOUNT = 10_000_000_000  # $10B hard ceiling (skip M&O mega-contracts)
 
-# Dataset builder
-TOP_N_TO_REMOVE = 20  # remove top-N companies by contract count in Stage 1
-
 # Scoring weights (sum = 100)
 SCORE_WEIGHTS = {
     "value_to_mcap": 30,    # contract value as % of market cap

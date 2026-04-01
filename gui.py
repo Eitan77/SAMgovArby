@@ -322,6 +322,23 @@ def _file_stat(path: Path) -> str:
     return f"{row_str} · {size_str} · {mtime}"
 
 
+def normalize_date(date_str: str) -> str:
+    """Convert M/D/YYYY to YYYY-MM-DD for consistent date comparison."""
+    if not date_str:
+        return ""
+    date_str = date_str.strip()
+    if len(date_str) >= 10 and date_str[4] == '-':
+        return date_str[:10]  # Already YYYY-MM-DD
+    try:
+        parts = date_str.split('/')
+        if len(parts) == 3:
+            m, d, y = parts
+            return f"{y}-{int(m):02d}-{int(d):02d}"
+    except (ValueError, IndexError):
+        pass
+    return date_str[:10]
+
+
 # ─── LogViewer ────────────────────────────────────────────────────────────────
 
 class LogViewer(QPlainTextEdit):
@@ -533,6 +550,10 @@ def _summary_stats(rows: list[dict]) -> dict:
     tp_hits = sl_hits = timeouts = 0
 
     for r in rows:
+        # Only count rows that passed all filters and generated actual trades
+        if r.get("filter_result") != "pass":
+            continue
+
         try:
             pnl = float(r.get("pnl_pct", 0))
             pnls.append(pnl)
@@ -884,20 +905,54 @@ def _make_stat_card(label: str, value: str, value_color: str = "#cdd6f4") -> QWi
 # ─── TradesDialog ─────────────────────────────────────────────────────────────
 
 class TradesDialog(QWidget):
-    """Floating window showing individual trade rows."""
+    """Floating window showing individual trade rows with tabs for trades vs. filtered."""
     def __init__(self, path: Path, title: str, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle(title)
-        self.resize(1100, 600)
+        self.resize(1200, 650)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
-        view, model, _ = make_table()
-        model.load(path, newest_first=True)
-        lay.addWidget(view)
+
+        # Load CSV data
+        headers, all_rows = _load_csv(path)
+
+        # Create tabs
+        tabs = QTabWidget()
+
+        # Tab 1: Actual trades (filter_result == "pass")
+        trades_only = [r for r in all_rows if r.get("filter_result") == "pass"]
+        trades_view, trades_model, _ = make_table()
+        if trades_only:
+            import tempfile
+            import csv as _csv
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='') as f:
+                writer = _csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(trades_only)
+                temp_path = f.name
+            trades_model.load(Path(temp_path), newest_first=True)
+            import os
+            os.unlink(temp_path)
+        tabs.addTab(trades_view, f"🎯 Actual Trades ({len(trades_only)})")
+
+        # Tab 2: All rows with filter breakdown
+        all_view, all_model, _ = make_table()
+        import tempfile
+        import csv as _csv
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='') as f:
+            writer = _csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(all_rows)
+            temp_path = f.name
+        all_model.load(Path(temp_path), newest_first=True)
+        import os
+        os.unlink(temp_path)
+        tabs.addTab(all_view, f"📋 All Rows ({len(all_rows)})")
+
+        lay.addWidget(tabs)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         lay.addWidget(close_btn)
-        self._model = model
 
 
 # ─── BacktestTab ──────────────────────────────────────────────────────────────
@@ -942,10 +997,10 @@ class BacktestTab(QWidget):
         mbl.addWidget(self._mode_combo)
         lv.addWidget(mode_box)
 
-        # Data year — fixed to 2023 (FY2023 dataset)
-        year_box = QGroupBox("Data Year")
+        # Data year — uses full date range (all years in dataset)
+        year_box = QGroupBox("Data Range")
         ybf = QVBoxLayout(year_box)
-        yr_lbl = QLabel("2023  (FY2023 — Jan 1 → Dec 31)")
+        yr_lbl = QLabel("Full dataset  (All awards 2000–2099)")
         yr_lbl.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
         ybf.addWidget(yr_lbl)
         lv.addWidget(year_box)
@@ -1079,8 +1134,8 @@ class BacktestTab(QWidget):
         args = [
             "-u",  # unbuffered output
             str(SCRIPTS_DIR / "backtest.py"),
-            "--start",     "2023-01-01",
-            "--end",       "2023-12-31",
+            "--start",     "2000-01-01",
+            "--end",       "2099-12-31",
             "--tp",        str(self._tp.value()),
             "--sl",        str(self._sl.value()),
             "--hold",      str(self._hold.value()),
@@ -1101,8 +1156,11 @@ class BacktestTab(QWidget):
         self._load_results()
 
     def _load_results(self):
-        # backtest.py writes to backtest_results_2023.csv (year-specific)
-        path = SCRIPTS_DIR / "backtest_results_2023.csv"
+        # backtest.py writes to backtest_results_YYYY.csv (year from start date)
+        # Try 2000 first (for full date range), then 2023 (for legacy)
+        path = SCRIPTS_DIR / "backtest_results_2000.csv"
+        if not path.exists():
+            path = SCRIPTS_DIR / "backtest_results_2023.csv"
         headers, rows = _load_csv(path)
         stats = _summary_stats(rows)
         breakdown = self._load_breakdown()
@@ -1275,7 +1333,9 @@ class BacktestTab(QWidget):
         if self._trades_window and not self._trades_window.isVisible():
             self._trades_window = None
         if not self._trades_window:
-            results_file = SCRIPTS_DIR / "backtest_results_2023.csv"
+            results_file = SCRIPTS_DIR / "backtest_results_2000.csv"
+            if not results_file.exists():
+                results_file = SCRIPTS_DIR / "backtest_results_2023.csv"
             self._trades_window = TradesDialog(
                 results_file, "Individual Trades — Backtest Results"
             )
@@ -1311,8 +1371,8 @@ class OptimizerTab(QWidget):
         sf = QVBoxLayout(settings)
         sf.setSpacing(8)
 
-        # Data year — fixed to 2023
-        yr_lbl = QLabel("Data Year: 2023  (FY2023 — Jan 1 → Dec 31)")
+        # Data range — full dataset
+        yr_lbl = QLabel("Data Range: Full dataset (All awards 2000–2099)")
         yr_lbl.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
         sf.addWidget(yr_lbl)
 
@@ -1377,8 +1437,8 @@ class OptimizerTab(QWidget):
             "-u",  # unbuffered output
             str(SCRIPTS_DIR / "optimizer.py"),
             "from-training-csv", csv_path,
-            "--start", "2023-01-01",
-            "--end",   "2023-12-31",
+            "--start", "2000-01-01",
+            "--end",   "2099-12-31",
         ]
 
         self._run_btn.setEnabled(False)
@@ -1515,7 +1575,7 @@ class TrainingDataTab(QWidget):
         self._s1_status.setObjectName("status_missing")
         self._s1_status.setWordWrap(True)
         s1l.addWidget(QLabel("Source: SAM.gov FirstReport.csv  |  Output: filtered_training_set.csv"))
-        s1l.addWidget(QLabel("Filters: $1M–$10B • Remove IDV/IDIQ • Top-20 companies"))
+        s1l.addWidget(QLabel("Filters: $1M–$10B • Remove IDV/IDIQ"))
         s1l.addWidget(self._s1_status)
         self._btn_s1 = QPushButton("▶  Run Build (all stages)")
         self._btn_s1.setObjectName("run_btn")
@@ -1591,6 +1651,23 @@ class TrainingDataTab(QWidget):
             QMessageBox.warning(self, "Missing file",
                                 "training_set_final.csv not found. Run the build first.")
             return
+
+        # Check if already enriched by looking for price columns
+        try:
+            with open(stage3) as f:
+                reader = csv.DictReader(f)
+                first_row = next(reader, None)
+                if first_row and any(col in first_row for col in ["open_t0", "close_t0", "price_t0"]):
+                    reply = QMessageBox.question(self, "Already enriched",
+                        "This file appears to already be enriched with price data.\n\n"
+                        "Enriching again will overwrite existing data.\n\n"
+                        "Continue?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    if reply == QMessageBox.StandardButton.No:
+                        return
+        except Exception:
+            pass
+
         self._set_building(True)
         args = [str(SCRIPTS_DIR / "enrich_ohlc.py"), str(stage3)]
         PROC.start("enrich_ohlc", args, log_widget=self._log, on_finished=self._on_finished)

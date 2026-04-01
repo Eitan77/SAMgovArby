@@ -22,6 +22,23 @@ from filter_engine_bt import apply_filters_bt_from_training
 
 log = logging.getLogger("optimizer")
 
+
+def normalize_date(date_str: str) -> str:
+    """Convert M/D/YYYY to YYYY-MM-DD for consistent date comparison."""
+    if not date_str:
+        return ""
+    date_str = date_str.strip()
+    if len(date_str) >= 10 and date_str[4] == '-':
+        return date_str[:10]  # Already YYYY-MM-DD
+    try:
+        parts = date_str.split('/')
+        if len(parts) == 3:
+            m, d, y = parts
+            return f"{y}-{int(m):02d}-{int(d):02d}"
+    except (ValueError, IndexError):
+        pass
+    return date_str[:10]
+
 OPT_RESULTS_FILE = os.path.join(os.path.dirname(__file__), "optimizer_results.csv")
 
 # Parameter grid - optimizes: score threshold, TP/SL/hold, and market cap filter
@@ -122,8 +139,8 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
     if start_date or end_date:
         before = len(rows)
         rows = [r for r in rows
-                if (not start_date or r.get("posted_date", "")[:10] >= start_date)
-                and (not end_date   or r.get("posted_date", "")[:10] <= end_date)]
+                if (not start_date or normalize_date(r.get("posted_date", "")) >= start_date)
+                and (not end_date   or normalize_date(r.get("posted_date", "")) <= end_date)]
         log.info(f"Date filter {start_date} -> {end_date}: {before} -> {len(rows)} rows")
 
     # Filter for rows with OHLC data (tickers that were enriched)

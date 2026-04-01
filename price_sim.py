@@ -217,8 +217,15 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
     stop_loss_price   = entry_price * (1 - stop_loss_pct)
 
     # entry date from open_t0's day index — use posted_date as T0 date
-    entry_date_str = row.get("posted_date", "")[:10]
-    entry_date = datetime.strptime(entry_date_str, "%Y-%m-%d")
+    entry_date_str = row.get("posted_date", "")
+    # Handle both YYYY-MM-DD and M/D/YYYY formats
+    if entry_date_str and len(entry_date_str) > 0:
+        if entry_date_str.count('/') == 2:  # M/D/YYYY format
+            parts = entry_date_str.split('/')
+            if len(parts) == 3:
+                m, d, y = parts
+                entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
     ticker = row.get("ticker", "")
 
     # Walk T1..T{max_hold_days}, tracking peak high for MFE
