@@ -53,6 +53,7 @@ def _build_funnel_breakdown(all_results, training_csv=None):
         # Stage 3 — enriched training CSV
         "stage3_after_enrich": 0,
         # Backtest filters
+        "backtest_low_confidence": 0,  # Ticker confidence below minimum
         "backtest_market_cap": 0,
         "backtest_8k": 0,
         "backtest_dilutive": 0,
@@ -126,6 +127,11 @@ def _build_funnel_breakdown(all_results, training_csv=None):
                 breakdown["backtest_8k"] += 1
             elif re.search(r"dilutive", reason, re.I):
                 breakdown["backtest_dilutive"] += 1
+            elif re.search(r"ticker confidence.*below", reason, re.I):
+                breakdown["backtest_low_confidence"] += 1
+            else:
+                # Catch-all for other fail reasons
+                breakdown["backtest_low_confidence"] += 1
 
     return breakdown
 
