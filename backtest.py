@@ -524,10 +524,6 @@ if __name__ == "__main__":
     # Initialize logger with user's verbosity preference
     log = setup_logging("backtest", quiet=args.quiet, verbose=args.verbose, json_format=args.json)
 
-    # Extract year from start_date and use year-specific output filename
-    year = args.start.split("-")[0]
-    year_specific_output = os.path.join(os.path.dirname(__file__), f"backtest_results_{year}.csv")
-
     run_backtest(
         start_date=args.start,
         end_date=args.end,
@@ -537,6 +533,6 @@ if __name__ == "__main__":
         hold=args.hold,
         threshold=args.threshold,
         training_csv=args.training_csv,
-        output_file=year_specific_output,
+        output_file=RESULTS_FILE,
         max_market_cap=args.max_market_cap,
     )
