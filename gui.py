@@ -1289,39 +1289,71 @@ class BacktestTab(QWidget):
         return {}
 
     def _display_breakdown(self, breakdown):
-        """Display funnel as right panel column."""
-        box = QGroupBox("Removal Breakdown")
+        """Display complete funnel breakdown from raw to final trades."""
+        box = QGroupBox("Removal Breakdown (Funnel)")
         lay = QVBoxLayout(box)
-        lay.setSpacing(3)
+        lay.setSpacing(4)
         lay.setContentsMargins(6, 6, 6, 6)
 
-        total = breakdown.get("stage1_total", 1)
-        if total == 0:
-            total = breakdown.get("stage3_after_enrich", 1)
+        # Use raw_rows_read as the base for percentage calculation
+        raw_total = breakdown.get("raw_rows_read", 146439)
+        if raw_total == 0:
+            raw_total = 1
 
         def pct(c):
-            return f"({c*100/total:.1f}%)" if total else ""
+            return f"({c*100/raw_total:.1f}%)" if raw_total else ""
 
+        # Calculate amounts removed at each stage
+        raw = breakdown.get("raw_rows_read", 0)
+        stage1_after = breakdown.get("stage1_total", 0)
+        stage1_removed = raw - stage1_after
+
+        stage2_resolved = breakdown.get("stage2_ticker_resolved", 0)
+        stage2_failed = breakdown.get("stage2_ticker_failed", 0)
+
+        stage3_enriched = breakdown.get("stage3_after_enrich", 0)
+
+        # Build complete funnel
         items = [
-            ("Total 2023 Contracts", breakdown.get("stage1_total", 0)),
-            ("Removed: IDIQ", breakdown.get("stage1_idiq", 0)),
-            ("Removed: Top-20", breakdown.get("stage1_top20", 0)),
-            ("Removed: $1M-$10B", breakdown.get("stage1_value_range", 0)),
-            ("Removed: Ticker Failed", breakdown.get("stage3_ticker_failed", 0) + breakdown.get("backtest_no_ticker", 0)),
-            ("Removed: Market Cap", breakdown.get("backtest_market_cap", 0)),
-            ("Removed: Low Score", breakdown.get("backtest_low_score", 0)),
-            ("✓ ACTUAL TRADES", breakdown.get("traded", 0)),
+            ("📥 Raw Records (FirstReport.csv)", raw, None),
+            ("  └─ Stage 1: Load & Filter", stage1_after, "#89b4fa"),
+            ("    └─ Removed at Stage 1", stage1_removed, None),
+            ("  └─ Stage 2: Resolve Tickers", breakdown.get("stage2_ticker_resolved", 0), "#89b4fa"),
+            ("    └─ Removed: Ticker Failed", breakdown.get("stage2_ticker_failed", 0), None),
+            ("  └─ Stage 3: Enrich Signals", breakdown.get("stage3_after_enrich", 0), "#89b4fa"),
+            ("  └─ Backtest: Apply Filters", breakdown.get("stage3_after_enrich", 0) - breakdown.get("backtest_market_cap", 0) - breakdown.get("backtest_low_score", 0) - breakdown.get("backtest_8k", 0) - breakdown.get("backtest_dilutive", 0) - breakdown.get("backtest_no_ticker", 0) - breakdown.get("backtest_no_price", 0) - breakdown.get("backtest_duplicate", 0), "#89b4fa"),
+            ("    ├─ Removed: Market Cap > $500M", breakdown.get("backtest_market_cap", 0), None),
+            ("    ├─ Removed: 8-K Filed < 2d", breakdown.get("backtest_8k", 0), None),
+            ("    ├─ Removed: Dilutive Filing", breakdown.get("backtest_dilutive", 0), None),
+            ("    ├─ Removed: Low Score < Threshold", breakdown.get("backtest_low_score", 0), None),
+            ("    ├─ Removed: No Ticker", breakdown.get("backtest_no_ticker", 0), None),
+            ("    ├─ Removed: No Price Data", breakdown.get("backtest_no_price", 0), None),
+            ("    └─ Removed: Duplicate", breakdown.get("backtest_duplicate", 0), None),
+            ("✅ FINAL TRADES FIRED", breakdown.get("traded", 0), "#a6e3a1"),
         ]
 
-        for label, count in items:
+        for label, count, color in items:
             h = QHBoxLayout()
             h.setSpacing(8)
+            h.setContentsMargins(0, 1, 0, 1)
             lbl = QLabel(label)
             val = QLabel(f"{count:,} {pct(count)}")
             val.setAlignment(Qt.AlignmentFlag.AlignRight)
-            if "ACTUAL" in label:
+
+            # Style key metrics
+            if "Raw Records" in label or "FINAL" in label:
+                lbl.setStyleSheet("font-weight: bold; color: #cdd6f4;")
+                val.setStyleSheet("font-weight: bold; color: #cdd6f4;")
+            elif color == "#89b4fa":
+                lbl.setStyleSheet("color: #89b4fa; font-weight: bold;")
+                val.setStyleSheet("color: #89b4fa;")
+            elif "FINAL" in label:
                 lbl.setStyleSheet("font-weight: bold; color: #a6e3a1;")
                 val.setStyleSheet("font-weight: bold; color: #a6e3a1;")
+            else:
+                lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
+                val.setStyleSheet("color: #a6adc8; font-size: 11px;")
+
             h.addWidget(lbl, 1)
             h.addWidget(val, 0)
             lay.addLayout(h)
