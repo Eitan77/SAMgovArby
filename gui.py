@@ -1088,7 +1088,7 @@ class BacktestTab(QWidget):
         placeholder.setStyleSheet("color: #585b70;")
         placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._breakdown_lay.addWidget(placeholder)
-        self._breakdown_box.setMaximumWidth(280)
+        self._breakdown_box.setMaximumWidth(380)
         chart_breakdown.addWidget(self._breakdown_box, 0)
 
         right.addLayout(chart_breakdown, 1)
@@ -1338,8 +1338,11 @@ class BacktestTab(QWidget):
             h.setSpacing(8)
             h.setContentsMargins(0, 1, 0, 1)
             lbl = QLabel(label)
+            lbl.setWordWrap(True)
             val = QLabel(f"{count:,} {pct(count)}")
             val.setAlignment(Qt.AlignmentFlag.AlignRight)
+            val.setMinimumWidth(100)
+            val.setWordWrap(False)
 
             # Style key metrics
             if "Raw Records" in label or "FINAL" in label:
