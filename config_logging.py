@@ -79,6 +79,7 @@ def setup_logging(
     # Create handler
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(level)
+    handler.flush = sys.stdout.flush  # Ensure logs flush immediately for GUI capture
 
     # Create formatter
     if json_format:

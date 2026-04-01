@@ -8,7 +8,6 @@ Pipeline (sequential, checkpoint-resumable):
 
 Filters applied in Stage 1:
   - Keep $1M–$10B awards only
-  - Remove top-20 companies by contract count (bulk spammers)
   - Remove all IDIQ contracts
 
 Stages 2–3 only process rows that pass each prior gate (ticker resolved).
@@ -35,7 +34,6 @@ import os
 import sys
 import time
 import warnings
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -47,7 +45,7 @@ import yfinance as yf
 
 from config_logging import setup_logging, add_verbosity_flags
 from config import (
-    MIN_CONTRACT_VALUE, MAX_AWARD_AMOUNT, TOP_N_TO_REMOVE,
+    MIN_CONTRACT_VALUE, MAX_AWARD_AMOUNT,
     EDGAR_RATE_LIMIT, EDGAR_8K_ENRICHMENT_DAYS, EDGAR_USER_AGENT,
 )
 from sam_gov_reader import read_sam_gov_csv, find_sam_gov_csv, ContractRecord
@@ -274,7 +272,6 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[lis
     log.info("=" * 60)
     log.info("STAGE 1: LOAD & FILTER")
     log.info(f"  Range  : ${MIN_CONTRACT_VALUE/1e6:.0f}M – ${MAX_AWARD_AMOUNT/1e9:.0f}B")
-    log.info(f"  Remove : top {TOP_N_TO_REMOVE} companies by contract count")
     log.info(f"  Remove : IDV/IDIQ contracts (filtered at read time)")
     if month_filter:
         log.info(f"  Month  : {month_filter} (March=3)")
@@ -312,18 +309,6 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[lis
     awards = list(awards_by_key.values())
     after_load = len(awards)
     log.info(f"  {total_rows:,} rows read → {after_load:,} awards (amount/IDV filtered at read time)")
-
-    # ── Remove top-N companies by contract count ──────────────────────────────
-    name_counts = Counter(a["awardee_name"] for a in awards)
-    top_names = {name for name, _ in name_counts.most_common(TOP_N_TO_REMOVE)}
-    log.info(f"  Top {TOP_N_TO_REMOVE} companies removed (by contract volume):")
-    for name, cnt in name_counts.most_common(TOP_N_TO_REMOVE):
-        log.info(f"    {cnt:>6,}  {name}")
-
-    awards = [a for a in awards if a["awardee_name"] not in top_names]
-    records_by_key = {a["award_key"]: records_by_key[a["award_key"]] for a in awards}
-    dropped_top = after_load - len(awards)
-    log.info(f"  Dropped {dropped_top:,} contracts from top-{TOP_N_TO_REMOVE} companies")
     log.info(f"  Final: {len(awards):,} contracts")
 
     _write_csv(FILTERED_CSV, awards)
@@ -331,7 +316,6 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[lis
     _save_cp(CP_STAGE1, {
         "total_rows_read": total_rows,
         "after_load": after_load,
-        "dropped_top_n": dropped_top,
         "final_count": len(awards),
     })
 
@@ -427,12 +411,14 @@ def stage2_resolve_tickers(
     log.info(f"  Cache  : {os.path.basename(TICKER_CACHE_V4_FILE)}")
     log.info(f"  Output : {os.path.basename(STAGE2_CSV)}")
     log.info("=" * 60)
+    print("[STAGE2_START] Beginning ticker resolution...", flush=True)
     t0 = time.time()
 
     cp = _load_cp(CP_STAGE2)
     already_done = len(cp)
     if already_done:
         log.info(f"  Resuming: {already_done:,} awards already in checkpoint")
+        print(f"[STAGE2_RESUME] {already_done:,} awards already resolved in checkpoint", flush=True)
 
     edgar_map = _load_edgar_map()
     resolver  = TickerResolverV4(edgar_map, cache_path=TICKER_CACHE_V4_FILE)
@@ -502,14 +488,14 @@ def stage2_resolve_tickers(
             pct_resolved = resolved_count / (i + 1) * 100
             log.info(f"  [{i+1:,}/{len(unique_entity_keys):,} — {pct:.1f}%] "
                      f"resolved={resolved_count:,} ({pct_resolved:.1f}%)  unresolved={unresolved_count:,}")
-            print(f"[STAGE2_PROGRESS] {pct:.0f}% | Resolved: {resolved_count:,} | Unresolved: {unresolved_count:,}")
+            print(f"[STAGE2_PROGRESS] {pct:.0f}% | Resolved: {resolved_count:,} | Unresolved: {unresolved_count:,}", flush=True)
 
     resolver.save_cache()
     _save_cp(CP_STAGE2, cp)
     pct_resolved = resolved_count / len(unique_entity_keys) * 100 if unique_entity_keys else 0
     log.info(f"  Resolution complete: {resolved_count:,} resolved ({pct_resolved:.1f}%), "
              f"{unresolved_count:,} unresolved, {skipped_count:,} from checkpoint")
-    print(f"[STAGE2_COMPLETE] {resolved_count:,} resolved | {unresolved_count:,} unresolved | {pct_resolved:.1f}%")
+    print(f"[STAGE2_COMPLETE] {resolved_count:,} resolved | {unresolved_count:,} unresolved | {pct_resolved:.1f}%", flush=True)
 
     enriched = []
     for award in awards:
@@ -630,20 +616,26 @@ def _fetch_year_history(ticker: str, year: int):
 
 
 def _slice_price_window(hist, date_str: str, n_days: int = 7) -> dict:
-    """Slice n_days of OHLC from a pre-fetched full-year DataFrame.
+    """Get OHLC prices for the contract award date and following days (or next trading day if weekend).
 
-    Returns open/high/low/close/price/return columns for t0..t{n}.
+    Returns n_days+1 of data starting from the contract date (or next trading day).
     """
     if hist is None or hist.empty or not date_str:
         return {}
     try:
         import pandas as pd
-        start_dt = datetime.strptime(date_str, "%Y-%m-%d")
-        future = hist[hist.index >= pd.Timestamp(start_dt)]
-        if future.empty:
+        target_dt = datetime.strptime(date_str, "%Y-%m-%d")
+        target_ts = pd.Timestamp(target_dt)
+
+        # Find the first available trading day on or after the contract date
+        candidates = hist[hist.index >= target_ts]
+        if candidates.empty:
             return {}
-        sliced = future.iloc[: n_days + 1]
+
+        # Get n_days+1 of data starting from the first available date
+        sliced = candidates.iloc[:n_days + 1]
         prices: dict = {}
+
         for i in range(len(sliced)):
             row = sliced.iloc[i]
             o = round(float(row.get("Open",  0)), 4)
@@ -654,7 +646,9 @@ def _slice_price_window(hist, date_str: str, n_days: int = 7) -> dict:
             prices[f"high_t{i}"]  = h
             prices[f"low_t{i}"]   = l
             prices[f"close_t{i}"] = c
-            prices[f"price_t{i}"] = c  # alias used elsewhere
+            prices[f"price_t{i}"] = c
+
+        # Calculate returns
         if prices.get("price_t0", 0) > 0:
             t0p = prices["price_t0"]
             for i in range(len(sliced)):
@@ -663,7 +657,8 @@ def _slice_price_window(hist, date_str: str, n_days: int = 7) -> dict:
                     prices[f"return_t{i}"] = round((p / t0p - 1) * 100, 4)
                 else:
                     prices[f"return_t{i}"] = ""
-        return prices
+            return prices
+        return {}
     except Exception as e:
         log.debug(f"Price slice error {date_str}: {e}")
         return {}
@@ -793,7 +788,9 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
         date_str = a.get("posted_date", "")
         if ticker and date_str:
             try:
-                year = int(date_str[:4])
+                # date_str is in M/D/YYYY format (e.g., "9/24/2021")
+                parts = date_str.split('/')
+                year = int(parts[2]) if len(parts) == 3 else int(date_str[:4])
             except (ValueError, IndexError):
                 continue
             ticker_years.setdefault((ticker, year), []).append(a)
@@ -859,18 +856,22 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
 
         # ── OHLC prices: slice from pre-fetched history ───────────────────
         year_key = None
+        normalized_date = None
         if ticker and date_str:
             try:
-                year_key = (ticker, int(date_str[:4]))
+                # Convert M/D/YYYY or MM/DD/YYYY to YYYY-MM-DD
+                parts = date_str.split('/')
+                if len(parts) == 3:
+                    m, d, y = parts
+                    normalized_date = f"{y}-{int(m):02d}-{int(d):02d}"
+                    year_key = (ticker, int(y))
             except (ValueError, IndexError):
                 pass
         hist_df = history_cache.get(year_key) if year_key else None
-        prices = _slice_price_window(hist_df, date_str)
+        prices = _slice_price_window(hist_df, normalized_date)
 
         if prices:
-            log.debug(f"    open_t0={prices.get('open_t0','?')}  close_t7={prices.get('close_t7','?')}")
-        else:
-            log.warning(f"    no price data for {ticker} on {date_str}")
+            log.debug(f"    open_t0={prices.get('open_t0','?')}")
 
         # ── Historical market cap (quarterly balance sheet → split-adjusted fallback)
         if ticker and date_str:

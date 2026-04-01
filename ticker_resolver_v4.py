@@ -139,7 +139,7 @@ class TickerResolverV4:
             return self._make_result(primary_name, _normalize(primary_name),
                                      None, None, "none", "unresolved", "non_public_entity")
 
-        # Tier 1: CAGE → GLEIF → LEI → OpenFIGI
+        # Tier 1: CAGE → Company Name → GLEIF → LEI → OpenFIGI
         if record.cage_code:
             r = self._resolve_via_cage(record)
             if r.get("resolved_ticker"):
@@ -159,7 +159,7 @@ class TickerResolverV4:
             if r:
                 return r
 
-        # Tier 3: multi-name fuzzy match
+        # Tier 3: multi-name fuzzy match (lowered threshold)
         for name in names:
             r = self._fuzzy_match(name)
             if r:
@@ -208,31 +208,88 @@ class TickerResolverV4:
 
         return False
 
-    # ── Tier 1: CAGE → GLEIF → LEI → OpenFIGI ────────────────────────────────
+    # ── Tier 1: CAGE → Company Name → LEI → OpenFIGI ────────────────────────────
 
     def _resolve_via_cage(self, record: ContractRecord) -> dict:
+        """Try to resolve via CAGE code using GLEIF name search → LEI → OpenFIGI.
+
+        Note: GLEIF API requires internet connectivity. Falls back to EDGAR tiers
+        if GLEIF is unavailable.
+        """
+        if not record.cage_code:
+            return {}
+
         primary_name = record.contractor_name or record.legal_business_name
-        cage_result = self.cage_resolver.resolve_cage(record.cage_code)
-        if not cage_result.get("lei"):
+
+        # Build list of names to try (original + normalized variations)
+        names_to_try = []
+        for name in [record.contractor_name, record.legal_business_name, record.dba_name, record.parent_name]:
+            if name and name.strip():
+                names_to_try.append(name.strip())
+                # Also try without common suffixes
+                normalized = _strip_suffixes(_normalize(name))
+                if normalized and normalized not in names_to_try:
+                    names_to_try.append(normalized)
+
+        # If no names, Tier 1 can't proceed (fall through to Tiers 2-4)
+        if not names_to_try:
             return {}
 
-        lei = cage_result["lei"]
-        lei_result = self.lei_resolver.resolve_lei(lei)
-        if not lei_result.get("ticker"):
-            return {}
+        for name in names_to_try:
+            try:
+                import requests
+                # Try searching GLEIF by company name (try exact and partial matches)
+                for search_name in [name, name.split()[0:2]]:  # Try full name and first 2 words
+                    if isinstance(search_name, list):
+                        search_name = " ".join(search_name)
+                    if not search_name or len(search_name) < 3:
+                        continue
 
-        ticker = lei_result["ticker"]
-        cik = lei_result.get("cik", "")
-        mc = self._get_market_cap(ticker)
-        norm = _normalize(primary_name)
-        audit = [
-            {"path": "cage_to_lei", "source": "GLEIF", "lei": lei,
-             "confidence": cage_result.get("confidence")},
-            {"path": "lei_to_ticker", "source": "OpenFIGI", "ticker": ticker,
-             "confidence": lei_result.get("confidence")},
-        ]
-        return self._make_result(primary_name, norm, ticker, cik, "high",
-                                  "cage_lei_openfigi", None, mc, audit)
+                    params = {
+                        "filter[registered_as]": search_name,
+                        "page[size]": 5
+                    }
+                    resp = requests.get(
+                        "https://leilookup.gleif.org/api/v3/lei-records",
+                        params=params,
+                        headers={"Accept": "application/json"},
+                        timeout=10
+                    )
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        records = data.get("lei_records", [])
+
+                        # Try each returned LEI until one resolves to a ticker
+                        for record_item in records:
+                            lei = record_item.get("lei")
+                            if lei:
+                                # Now resolve LEI to ticker
+                                lei_result = self.lei_resolver.resolve_lei(lei)
+                                if lei_result.get("ticker"):
+                                    ticker = lei_result["ticker"]
+                                    cik = lei_result.get("cik", "")
+                                    mc = self._get_market_cap(ticker)
+                                    norm = _normalize(primary_name)
+                                    return self._make_result(primary_name, norm, ticker, cik, "high",
+                                                            "cage_gleif_lei_openfigi", None, mc)
+                    else:
+                        log.debug(f"Tier 1 GLEIF API error for '{search_name}': HTTP {resp.status_code}")
+            except requests.exceptions.ConnectionError as e:
+                # GLEIF unreachable (no internet or DNS failure) — log once, fall through
+                log.debug(f"Tier 1 GLEIF unreachable (network): {type(e).__name__}")
+                return {}
+            except requests.exceptions.Timeout:
+                log.debug(f"Tier 1 GLEIF timeout for '{name}'")
+                continue
+            except Exception as e:
+                # Unexpected error — log and continue to next name
+                log.debug(f"Tier 1 error for CAGE {record.cage_code} / '{name}': {type(e).__name__}: {e}")
+                continue
+
+        # Tier 1 could not resolve (GLEIF unavailable, no matches, or API errors)
+        # Fall through to Tiers 2-4 (EDGAR exact/fuzzy/substring)
+        return {}
 
     # ── Tier 2: multi-name EDGAR exact match ─────────────────────────────────
 
@@ -272,7 +329,8 @@ class TickerResolverV4:
             return None
         norm = _normalize(name)
         stripped = _strip_suffixes(norm)
-        min_score = 80 if len(stripped.split()) <= 3 else 85
+        # Lowered threshold from 80/85 to 70/75 to catch more matches
+        min_score = 70 if len(stripped.split()) <= 3 else 75
 
         results = process.extract(norm, self._edgar_names,
                                    scorer=fuzz.token_sort_ratio, limit=5)
@@ -295,6 +353,12 @@ class TickerResolverV4:
                     mc = self._get_market_cap(ticker)
                     return self._make_result(name, norm, ticker, cik,
                                               confidence, f"fuzzy_{evidence}", None, mc)
+            elif score >= 80:
+                # Accept without CIK validation if score is high enough
+                mc = self._get_market_cap(ticker)
+                if mc > 0:
+                    return self._make_result(name, norm, ticker, "", "low_medium",
+                                              f"fuzzy_score_{int(score)}", None, mc)
         return None
 
     # ── Tier 4: substring match ───────────────────────────────────────────────
@@ -315,12 +379,12 @@ class TickerResolverV4:
                 best_match = (edgar_stripped, edgar_orig, entry)
                 best_len = match_len
 
-        if not best_match or best_len < 10:
+        if not best_match or best_len < 7:
             return None
 
         edgar_stripped, _, entry = best_match
         longer = max(len(stripped), len(edgar_stripped))
-        if best_len / longer < 0.6:
+        if best_len / longer < 0.5:
             return None
 
         ticker = entry["ticker"]
