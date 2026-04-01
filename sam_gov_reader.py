@@ -125,7 +125,7 @@ def read_sam_gov_csv(path: str) -> Iterator[ContractRecord]:
                 parent_name=             (row.get("Ultimate Parent Legal Business Name") or "").strip(),
                 parent_uei=              (row.get("Ultimate Parent Unique Entity ID") or "").strip(),
                 award_amount=            amount,
-                posted_date=             _parse_date(row.get("Period of Performance Start Date") or ""),
+                posted_date=             _parse_date(row.get("Date Signed") or ""),
                 agency=                  (row.get("Contracting Agency Name") or "").strip(),
                 naics_code=              (row.get("NAICS Code") or "").strip(),
                 naics_description=       (row.get("NAICS Description") or "").strip(),
