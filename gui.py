@@ -1146,6 +1146,8 @@ class BacktestTab(QWidget):
         except Exception as e: log.warning(f"Non-critical error setting hold value: {e}")
         try: self._threshold.setValue(int(float(best.get("score_threshold", 40))))
         except Exception as e: log.warning(f"Non-critical error setting threshold value: {e}")
+        try: self._optimizer_max_mcap_m = int(float(best.get("max_mcap_M", 500)))
+        except Exception as e: log.warning(f"Non-critical error setting max_mcap value: {e}")
 
     def _run_backtest(self):
         ds = DATASET_CONFIGS[self._dataset_combo.currentText()]
@@ -1574,8 +1576,9 @@ class OptimizerTab(QWidget):
             ("Take Profit",_pct("tp_pct"),          "#a6e3a1"),
             ("Stop Loss",  _pct("sl_pct"),           "#f38ba8"),
             ("Hold Days",  _val("max_hold_days"),    "#cdf4f4"),
-            ("Max Mkt Cap",f"${float(_val('max_mcap_M', _val('max_market_cap_M', 0)))/1000:.0f}B"
-                            if _val("max_mcap_M") or _val("max_market_cap_M") else "—", "#f9e2af"),
+            ("Max Mkt Cap", (lambda m: f"${m/1000:.1f}B" if m >= 1000 else f"${m:.0f}M")(
+                                float(_val("max_mcap_M") or _val("max_market_cap_M") or 0))
+                            if (_val("max_mcap_M") or _val("max_market_cap_M")) else "—", "#f9e2af"),
         ]:
             row1.addWidget(_make_stat_card(label, value, color))
         self._best_lay.addLayout(row1)
