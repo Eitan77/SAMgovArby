@@ -209,9 +209,12 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
                 "naics": row.get("naics", ""),
             }
             has_pr = extra.get("has_press_release", False)
+            prior_wins = extra.get("agency_prior_win_count", 0)
+            is_first_agency = (prior_wins == 0)
 
             score, _ = score_contract(contract, market_cap,
-                                      threshold=threshold, has_press_release=has_pr)
+                                      threshold=threshold, has_press_release=has_pr,
+                                      is_first_agency_win=is_first_agency)
             if score < threshold:
                 continue
 

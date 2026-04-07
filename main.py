@@ -17,7 +17,7 @@ from config import SCORE_THRESHOLD, TZ, POLL_INTERVAL_HOURS, MIN_TICKER_CONFIDEN
 from sam_poller import fetch_recent_awards
 from filter_engine import apply_filters
 from scoring_engine import score_contract
-from ticker_resolver_v4 import resolve_ticker
+from resolver import resolve_ticker
 from trade_executor import execute_trade, check_and_exit_expired_positions
 
 # --- Logging setup ---

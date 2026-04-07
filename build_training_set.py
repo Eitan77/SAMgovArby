@@ -426,7 +426,7 @@ def stage2_resolve_tickers(
     Deduplicates by V4 cache key (CAGE code → UEI → legal name → contractor name),
     resolves once per unique entity, then maps to all matching awards.
     """
-    from ticker_resolver_v4 import TickerResolverV4
+    from resolver import TickerResolverV4
 
     log.info("=" * 60)
     log.info("STAGE 2: TICKER RESOLUTION (V4)")

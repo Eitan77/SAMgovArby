@@ -1153,12 +1153,13 @@ class BacktestTab(QWidget):
         args = [
             "-u",  # unbuffered output
             str(SCRIPTS_DIR / "backtest.py"),
-            "--start",     "2000-01-01",
-            "--end",       "2099-12-31",
-            "--tp",        str(self._tp.value()),
-            "--sl",        str(self._sl.value()),
-            "--hold",      str(self._hold.value()),
-            "--threshold", str(self._threshold.value()),
+            "--start",       "2000-01-01",
+            "--end",         "2099-12-31",
+            "--max-records", "999999",
+            "--tp",          str(self._tp.value()),
+            "--sl",          str(self._sl.value()),
+            "--hold",        str(self._hold.value()),
+            "--threshold",   str(self._threshold.value()),
             "--max-market-cap", str(self._optimizer_max_mcap_m * 1_000_000),
         ]
         if ds["stage3"].exists():
@@ -1270,7 +1271,9 @@ class BacktestTab(QWidget):
 
         # Update breakdown panel on right
         while self._breakdown_lay.count():
-            self._breakdown_lay.takeAt(0).widget().deleteLater()
+            item = self._breakdown_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         if breakdown:
             bd_box = self._display_breakdown(breakdown)
             for i in range(bd_box.layout().count()):
@@ -1316,14 +1319,6 @@ class BacktestTab(QWidget):
         lay.setSpacing(4)
         lay.setContentsMargins(6, 6, 6, 6)
 
-        # Use raw_rows_read as the base for percentage calculation
-        raw_total = breakdown.get("raw_rows_read", 146439)
-        if raw_total == 0:
-            raw_total = 1
-
-        def pct(c):
-            return f"({c*100/raw_total:.1f}%)" if raw_total else ""
-
         # Calculate amounts removed at each stage
         raw = breakdown.get("raw_rows_read", 0)
         stage1_after = breakdown.get("stage1_total", 0)
@@ -1349,33 +1344,50 @@ class BacktestTab(QWidget):
         # Use actual rows processed if available, otherwise derive from traded + removals
         bt_input = breakdown.get("backtest_rows_processed", traded + bt_removals)
 
+        # Percentage bases: use raw_rows_read for stages 1-3 only when available;
+        # use bt_input as base for the backtest filter stage percentages.
+        pipeline_base = raw if raw > 0 else None  # None = skip % for pipeline stages
+        bt_base = bt_input if bt_input > 0 else 1
+
+        def pct_pipeline(c):
+            if pipeline_base is None or pipeline_base == 0:
+                return ""
+            return f"({c*100/pipeline_base:.1f}%)"
+
+        def pct_bt(c):
+            return f"({c*100/bt_base:.1f}%)"
+
+        # Dynamic market-cap label from breakdown data
+        mcap_removals = breakdown.get("backtest_market_cap", 0)
+        mcap_label = f"    ├─ Removed: Market Cap > ${self._optimizer_max_mcap_m}M"
+
         # Build complete funnel
         items = [
-            ("📥 Raw Records (FirstReport.csv)", raw, None),
-            ("  └─ Stage 1: Load & Filter", stage1_after, "#89b4fa"),
-            ("    └─ Removed at Stage 1", stage1_removed, None),
-            ("  └─ Stage 2: Resolve Tickers", breakdown.get("stage2_ticker_resolved", 0), "#89b4fa"),
-            ("    └─ Removed: Ticker Failed", breakdown.get("stage2_ticker_failed", 0), None),
-            ("  └─ Stage 3: Enrich Signals", breakdown.get("stage3_after_enrich", 0), "#89b4fa"),
-            ("  └─ Backtest: Apply Filters", bt_input, "#89b4fa"),
-            ("    ├─ Removed: Ticker Confidence", breakdown.get("backtest_low_confidence", 0), None),
-            ("    ├─ Removed: Market Cap > $500M", breakdown.get("backtest_market_cap", 0), None),
-            ("    ├─ Removed: 8-K Filed < 2d", breakdown.get("backtest_8k", 0), None),
-            ("    ├─ Removed: Dilutive Filing", breakdown.get("backtest_dilutive", 0), None),
-            ("    ├─ Removed: Low Score < Threshold", breakdown.get("backtest_low_score", 0), None),
-            ("    ├─ Removed: No Ticker", breakdown.get("backtest_no_ticker", 0), None),
-            ("    ├─ Removed: No Price Data", breakdown.get("backtest_no_price", 0), None),
-            ("    └─ Removed: Duplicate", breakdown.get("backtest_duplicate", 0), None),
-            ("✅ FINAL TRADES FIRED", traded, "#a6e3a1"),
+            ("📥 Raw Records (FirstReport.csv)", raw, None, pct_pipeline),
+            ("  └─ Stage 1: Load & Filter", stage1_after, "#89b4fa", pct_pipeline),
+            ("    └─ Removed at Stage 1", stage1_removed, None, pct_pipeline),
+            ("  └─ Stage 2: Resolve Tickers", breakdown.get("stage2_ticker_resolved", 0), "#89b4fa", pct_pipeline),
+            ("    └─ Removed: Ticker Failed", breakdown.get("stage2_ticker_failed", 0), None, pct_pipeline),
+            ("  └─ Stage 3: Enrich Signals", breakdown.get("stage3_after_enrich", 0), "#89b4fa", pct_pipeline),
+            ("  └─ Backtest: Apply Filters", bt_input, "#89b4fa", pct_bt),
+            ("    ├─ Removed: Ticker Confidence", breakdown.get("backtest_low_confidence", 0), None, pct_bt),
+            (mcap_label, breakdown.get("backtest_market_cap", 0), None, pct_bt),
+            ("    ├─ Removed: 8-K Filed < 2d", breakdown.get("backtest_8k", 0), None, pct_bt),
+            ("    ├─ Removed: Dilutive Filing", breakdown.get("backtest_dilutive", 0), None, pct_bt),
+            ("    ├─ Removed: Low Score < Threshold", breakdown.get("backtest_low_score", 0), None, pct_bt),
+            ("    ├─ Removed: No Ticker", breakdown.get("backtest_no_ticker", 0), None, pct_bt),
+            ("    ├─ Removed: No Price Data", breakdown.get("backtest_no_price", 0), None, pct_bt),
+            ("    └─ Removed: Duplicate", breakdown.get("backtest_duplicate", 0), None, pct_bt),
+            ("✅ FINAL TRADES FIRED", traded, "#a6e3a1", pct_bt),
         ]
 
-        for label, count, color in items:
+        for label, count, color, pct_fn in items:
             h = QHBoxLayout()
             h.setSpacing(8)
             h.setContentsMargins(0, 1, 0, 1)
             lbl = QLabel(label)
             lbl.setWordWrap(True)
-            val = QLabel(f"{count:,} {pct(count)}")
+            val = QLabel(f"{count:,} {pct_fn(count)}")
             val.setAlignment(Qt.AlignmentFlag.AlignRight)
             val.setMinimumWidth(100)
             val.setWordWrap(False)
