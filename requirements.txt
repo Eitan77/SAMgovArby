@@ -6,3 +6,6 @@ pytz>=2024.1
 schedule>=1.2
 rapidfuzz>=3.6
 polars>=0.20
+PyQt6>=6.5
+matplotlib>=3.7
+pandas_market_calendars>=4.3

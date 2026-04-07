@@ -1,22 +1,18 @@
 """Check PRNewswire and Business Wire for existing press releases about a contract."""
 import logging
-import time
 import re
 import requests
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+from rate_limiter import RateLimiter
 
 log = logging.getLogger(__name__)
 
-_last_request = 0.0
+_news_limiter = RateLimiter(1.0)
 
 
 def _rate_limit():
-    global _last_request
-    elapsed = time.time() - _last_request
-    if elapsed < 1.0:
-        time.sleep(1.0 - elapsed)
-    _last_request = time.time()
+    _news_limiter.wait()
 
 
 def has_press_release(company_name, contract_title="", days_back=2):

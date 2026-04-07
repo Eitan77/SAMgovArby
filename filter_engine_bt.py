@@ -2,11 +2,9 @@
 from __future__ import annotations
 import logging
 from datetime import datetime
-import yfinance as yf
 from config import (MAX_MARKET_CAP, MIN_CONTRACT_VALUE,
                     MAX_8K_WINDOW_DAYS, MAX_DILUTIVE_WINDOW_DAYS,
                     MAX_PR_WINDOW_DAYS, MIN_TICKER_CONFIDENCE)
-from edgar_client import search_company
 
 log = logging.getLogger(__name__)
 
@@ -44,13 +42,15 @@ def _days_signed(earlier_str, later_str) -> int | None:
         return None
 
 
-def apply_filters_bt_from_training(row):
+def apply_filters_bt_from_training(row, max_market_cap=None):
     """Filter using pre-computed historical data from the training CSV.
 
     Uses date-based columns for tunable window filtering.
+    max_market_cap: override for MAX_MARKET_CAP (used by optimizer/backtest per-run).
     Returns (passed: bool, reason: str, extra: dict).
     """
     extra = {}
+    effective_mcap_limit = max_market_cap if max_market_cap is not None else MAX_MARKET_CAP
 
     # Filter 1: Minimum contract value
     award_amount = float(row.get("award_amount", 0))
@@ -77,8 +77,8 @@ def apply_filters_bt_from_training(row):
     if hist_mcap <= 0:
         return False, "No historical market cap data", extra
 
-    if hist_mcap > MAX_MARKET_CAP:
-        return False, f"Historical market cap ${hist_mcap/1e6:.0f}M exceeds ${MAX_MARKET_CAP/1e6:.0f}M limit", extra
+    if hist_mcap > effective_mcap_limit:
+        return False, f"Historical market cap ${hist_mcap/1e6:.0f}M exceeds ${effective_mcap_limit/1e6:.0f}M limit", extra
 
     # Filter 4: 8-K check — reject if 8-K filed ON OR AFTER award within window
     award_date = row.get("posted_date", "")
@@ -126,89 +126,3 @@ def apply_filters_bt_from_training(row):
     return True, "Passed filters (training-data mode)", extra
 
 
-def _parse_bool(val):
-    """Parse a boolean from CSV values (True/False/1/0/str)."""
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return bool(val)
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "1", "yes")
-    return False
-
-
-def apply_filters_bt(contract, ticker_cache=None):
-    """Backtest version of apply_filters. Skips: 8-K, press release, S-3 checks.
-
-    ticker_cache: dict keyed by company_name -> (ticker, market_cap, edgar_results)
-                  Pass the same dict across calls to avoid redundant API lookups.
-
-    Returns (passed: bool, reason: str, extra: dict).
-    """
-    if ticker_cache is None:
-        ticker_cache = {}
-
-    extra = {}
-
-    # Filter 1: IDIQ
-    if contract.get("is_idiq"):
-        return False, "IDIQ contract", extra
-
-    # Filter 2: Minimum contract value
-    if contract["award_amount"] < MIN_CONTRACT_VALUE:
-        return False, f"Contract ${contract['award_amount']:,.0f} below minimum", extra
-
-    # Filter 3: Market cap check — if ticker already set (watchlist mode), use it directly
-    company_name = contract["awardee_name"]
-
-    if contract.get("ticker") and contract.get("market_cap"):
-        ticker = contract["ticker"]
-        market_cap = contract["market_cap"]
-        extra["market_cap"] = market_cap
-        extra["ticker"] = ticker
-        extra["edgar_results"] = []
-        if market_cap > MAX_MARKET_CAP:
-            return False, f"Market cap ${market_cap/1e6:.0f}M exceeds ${MAX_MARKET_CAP/1e6:.0f}M limit", extra
-        return True, "Passed filters (watchlist mode)", extra
-
-    if company_name in ticker_cache:
-        cached = ticker_cache[company_name]
-        if cached is None:
-            return False, f"No tradeable ticker for '{company_name}' (cached)", extra
-        ticker, market_cap, edgar_results = cached
-    else:
-        ticker, market_cap, edgar_results = _resolve_ticker_and_mcap(company_name)
-        ticker_cache[company_name] = (ticker, market_cap, edgar_results) if ticker else None
-
-    if ticker is None:
-        return False, f"No tradeable ticker for '{company_name}'", extra
-
-    extra["market_cap"] = market_cap
-    extra["ticker"] = ticker
-    extra["edgar_results"] = edgar_results
-
-    if market_cap > MAX_MARKET_CAP:
-        return False, f"Market cap ${market_cap/1e6:.0f}M exceeds ${MAX_MARKET_CAP/1e6:.0f}M limit", extra
-
-    return True, "Passed filters (backtest mode)", extra
-
-
-def _resolve_ticker_and_mcap(company_name):
-    """Return (ticker, market_cap, edgar_results) or (None, 0, []) if not found."""
-    edgar_results = search_company(company_name)
-    if not edgar_results:
-        return None, 0, []
-
-    for result in edgar_results:
-        t = result.get("ticker", "")
-        if not t:
-            continue
-        try:
-            info = yf.Ticker(t).info
-            mc = info.get("marketCap")
-            if mc and mc > 0:
-                return t, mc, edgar_results
-        except Exception:
-            continue
-
-    return None, 0, edgar_results

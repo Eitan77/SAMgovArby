@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
+from config import SLIPPAGE_PCT, COMMISSION_PCT
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ def simulate_trade(ticker: str, award_date: str, take_profit_pct: float,
         return None
 
     entry_day = trading_days[0]
-    entry_price = float(df.loc[entry_day, "Open"])
+    entry_price = float(df.loc[entry_day, "Open"]) * (1 + SLIPPAGE_PCT)  # Adverse fill on buy
     if entry_price <= 0:
         return None
 
@@ -207,7 +208,7 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
     if entry_price_raw in ("", None, "None"):
         return None
     try:
-        entry_price = float(entry_price_raw)
+        entry_price = float(entry_price_raw) * (1 + SLIPPAGE_PCT)  # Adverse fill on buy
     except (ValueError, TypeError):
         return None
     if entry_price <= 0:
@@ -288,13 +289,17 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
 
 def _result(ticker, entry_day, entry_price, exit_day, exit_price,
             reason, tp_pct, sl_pct):
-    pnl_pct = (exit_price - entry_price) / entry_price
+    # Apply exit-side slippage (adverse fill) and round-trip commission
+    slipped_exit = exit_price * (1 - SLIPPAGE_PCT)
+    commission = (entry_price + slipped_exit) * COMMISSION_PCT
+    pnl = (slipped_exit - entry_price) - commission
+    pnl_pct = pnl / entry_price
     return {
         "ticker": ticker,
         "entry_date": str(entry_day.date()),
         "entry_price": round(entry_price, 4),
         "exit_date": str(exit_day.date()),
-        "exit_price": round(exit_price, 4),
+        "exit_price": round(slipped_exit, 4),
         "exit_reason": reason,
         "pnl_pct": round(pnl_pct * 100, 3),
         "hit_tp": reason == "take_profit",

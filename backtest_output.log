@@ -1,0 +1,27 @@
+2026-04-01 13:03:25 [INFO] Backtest: 2000-01-01 -> 2099-12-31 | TP=20% SL=6% Hold=3d Threshold=30 | MaxMCap=$0.5B
+2026-04-01 13:03:25 [INFO] Loading training CSV: datasets/training_set_final.csv
+2026-04-01 13:03:25 [INFO] Loaded 352 rows from training CSV
+2026-04-01 13:03:25 [INFO] 352 rows within date range 2000-01-01 -> 2099-12-31
+2026-04-01 13:03:25 [INFO] Processing 352 awards from training data...
+2026-04-01 13:03:25 [INFO] Score 42/100 | mcap=$35,488,050 | SRI INTERNATIONAL | Pass=True
+Traceback (most recent call last):
+  File "C:\Users\decla\Desktop\SAMgovArby\backtest.py", line 525, in <module>
+    run_backtest(
+  File "C:\Users\decla\Desktop\SAMgovArby\backtest.py", line 159, in run_backtest
+    result = _run_backtest_from_training(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\decla\Desktop\SAMgovArby\backtest.py", line 209, in _run_backtest_from_training
+    result = _process_training_row(row, tp, sl, hold, threshold)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\decla\Desktop\SAMgovArby\backtest.py", line 332, in _process_training_row
+    sim = simulate_trade_from_row(row, tp, sl, hold)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\decla\Desktop\SAMgovArby\price_sim.py", line 221, in simulate_trade_from_row
+    entry_date = datetime.strptime(entry_date_str, "%Y-%m-%d")
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\_strptime.py", line 653, in _strptime_datetime
+    tt, fraction, gmtoff_fraction = _strptime(data_string, format)
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\_strptime.py", line 432, in _strptime
+    raise ValueError("time data %r does not match format %r" %
+ValueError: time data '9/24/2021' does not match format '%Y-%m-%d'

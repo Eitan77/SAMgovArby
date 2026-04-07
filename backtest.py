@@ -156,25 +156,14 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
             "Then pass: --training-csv datasets/training_set_final.csv"
         )
 
-    import config as config_module
-    old_max_market_cap = None
-    if max_market_cap is not None:
-        old_max_market_cap = config_module.MAX_MARKET_CAP
-        config_module.MAX_MARKET_CAP = max_market_cap
-
     mcap_str = f" | MaxMCap=${max_market_cap/1e9:.1f}B" if max_market_cap else ""
     log.info(f"Backtest: {start_date} -> {end_date} | "
              f"TP={tp*100:.0f}% SL={sl*100:.0f}% Hold={hold}d Threshold={threshold}{mcap_str}")
 
-    result = _run_backtest_from_training(
+    return _run_backtest_from_training(
         training_csv, start_date, end_date, max_records,
         tp, sl, hold, threshold, output_file, max_market_cap
     )
-
-    if old_max_market_cap is not None:
-        config_module.MAX_MARKET_CAP = old_max_market_cap
-
-    return result
 
 
 def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
@@ -216,7 +205,7 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
 
     log.info(f"Processing {total_to_process} awards from training data...")
     for i, row in enumerate(rows[:max_records]):
-        result = _process_training_row(row, tp, sl, hold, threshold)
+        result = _process_training_row(row, tp, sl, hold, threshold, max_market_cap)
 
         # Deduplicate: only one trade per ticker per day
         if result.get("filter_result") == "pass" and result.get("ticker"):
@@ -267,7 +256,7 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     return stats, breakdown, all_results
 
 
-def _process_training_row(row, tp, sl, hold, threshold):
+def _process_training_row(row, tp, sl, hold, threshold, max_market_cap=None):
     """Process one row from the training CSV through filter -> score -> simulate."""
     sole_source = row.get("sole_source", "")
     if isinstance(sole_source, str):
@@ -283,7 +272,7 @@ def _process_training_row(row, tp, sl, hold, threshold):
     }
 
     # Filter using historical data
-    passed, reason, extra = apply_filters_bt_from_training(row)
+    passed, reason, extra = apply_filters_bt_from_training(row, max_market_cap=max_market_cap)
     base["filter_result"] = "pass" if passed else "fail"
     base["filter_reason"] = reason
     base["first_8k_date"] = extra.get("first_8k_date", "")
@@ -372,16 +361,6 @@ def _compute_stats(traded, tp, sl):
     avg_pnl = sum(pnls) / len(pnls) if pnls else 0
     win_rate = len(wins) / len(pnls) * 100 if pnls else 0
 
-    import math
-    if len(pnls) > 1:
-        mean = avg_pnl
-        variance = sum((p - mean) ** 2 for p in pnls) / len(pnls)
-        std = math.sqrt(variance)
-        sharpe = (mean / std * math.sqrt(252 / len(pnls))) if std > 0 else 0
-    else:
-        sharpe = 0
-        std = 0
-
     # Max drawdown (simple, on pnl_pct stream)
     cumulative = 0
     peak = 0
@@ -399,8 +378,6 @@ def _compute_stats(traded, tp, sl):
         "win_rate": round(win_rate, 1),
         "avg_pnl_pct": round(avg_pnl, 3),
         "total_pnl_pct": round(sum(pnls), 2),
-        "std_pnl": round(std, 3),
-        "sharpe": round(sharpe, 3),
         "max_drawdown_pct": round(max_dd, 2),
         "tp_hits": tp_hits,
         "sl_hits": sl_hits,
@@ -439,7 +416,6 @@ def _print_report(stats, all_results, traded, start_date, end_date):
         print(f"  Win Rate               : {stats['win_rate']}%")
         print(f"  Avg P&L per trade      : {stats['avg_pnl_pct']:+.2f}%")
         print(f"  Total P&L (sum)        : {stats['total_pnl_pct']:+.2f}%")
-        print(f"  Sharpe Ratio           : {stats['sharpe']:.3f}")
         print(f"  Max Drawdown           : -{stats['max_drawdown_pct']:.2f}%")
         print(f"  Best / Worst trade     : {stats['best_trade']:+.2f}% / {stats['worst_trade']:+.2f}%")
         print(f"  TP hits / SL hits / TO : {stats['tp_hits']} / {stats['sl_hits']} / {stats['timeouts']}")

@@ -1,8 +1,8 @@
 """SEC EDGAR API wrapper for company search and filing checks."""
 import logging
-import time
 import requests
 from config import EDGAR_RATE_LIMIT, EDGAR_USER_AGENT
+from rate_limiter import RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -12,15 +12,11 @@ FULL_TEXT_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index/company-search"
 EDGAR_COMPANY_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 
-_last_request = 0
+_edgar_limiter = RateLimiter(EDGAR_RATE_LIMIT)
 
 
 def _rate_limit():
-    global _last_request
-    elapsed = time.time() - _last_request
-    if elapsed < EDGAR_RATE_LIMIT:
-        time.sleep(EDGAR_RATE_LIMIT - elapsed)
-    _last_request = time.time()
+    _edgar_limiter.wait()
 
 
 def search_company(name):

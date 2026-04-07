@@ -1,5 +1,6 @@
 """Step 2: Apply rejection filters to parsed contracts."""
 import logging
+import threading
 import requests
 import yfinance as yf
 from config import MAX_MARKET_CAP, MIN_CONTRACT_VALUE
@@ -10,7 +11,18 @@ log = logging.getLogger(__name__)
 
 # In-process cache: company_name -> (ticker, market_cap, cik, edgar_results)
 # Avoids redundant API calls when the same company appears in multiple awards.
+_mcap_lock = threading.Lock()
 _mcap_cache: dict = {}
+
+
+def _get_cached_mcap(key):
+    with _mcap_lock:
+        return _mcap_cache.get(key)
+
+
+def _set_cached_mcap(key, value):
+    with _mcap_lock:
+        _mcap_cache[key] = value
 
 
 def apply_filters(contract):
@@ -32,11 +44,12 @@ def apply_filters(contract):
     # Filter 3: Market cap check (requires ticker lookup)
     company_name = contract["awardee_name"]
 
-    if company_name in _mcap_cache:
-        ticker, market_cap, cik, edgar_results = _mcap_cache[company_name]
+    cached = _get_cached_mcap(company_name)
+    if cached is not None:
+        ticker, market_cap, cik, edgar_results = cached
     else:
         ticker, market_cap, cik, edgar_results = _resolve_market_cap(company_name)
-        _mcap_cache[company_name] = (ticker, market_cap, cik, edgar_results)
+        _set_cached_mcap(company_name, (ticker, market_cap, cik, edgar_results))
 
     if market_cap is None:
         return False, f"Could not determine market cap for '{company_name}'", extra

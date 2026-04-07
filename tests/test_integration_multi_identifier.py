@@ -2,13 +2,29 @@
 import csv
 import os
 import pytest
-from ticker_resolver_v3 import TickerResolverV3
+from sam_gov_reader import ContractRecord
+from ticker_resolver_v4 import TickerResolverV4
+
+
+def _make_record(**kwargs) -> ContractRecord:
+    defaults = dict(
+        piid="", cage_code="", uei="", country_of_incorporation="USA",
+        contractor_name="", legal_business_name="", dba_name="",
+        parent_name="", parent_uei="", award_amount=0.0, posted_date="",
+        agency="", naics_code="", naics_description="", set_aside_code="",
+        extent_competed_code="", other_than_full_open="", idv_type="",
+        num_offers="", is_educational_institution=False, is_federal_agency=False,
+        is_airport_authority=False, is_council_of_governments=False,
+        is_community_dev_corp=False, is_federally_funded_rd=False,
+    )
+    defaults.update(kwargs)
+    return ContractRecord(**defaults)
+
 
 def test_real_contracts_resolution():
     """Test resolver on sample real contracts from training set."""
-    resolver = TickerResolverV3()
+    resolver = TickerResolverV4()
 
-    # Test a few real contracts if training CSV exists
     training_csv = "datasets/filtered_training_set.csv"
     if not os.path.exists(training_csv):
         pytest.skip("Training CSV not found; run build_training_set.py first")
@@ -19,7 +35,7 @@ def test_real_contracts_resolution():
     with open(training_csv) as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
-            if i >= 100:  # Test first 100 contracts
+            if i >= 100:
                 break
 
             test_count += 1
@@ -29,30 +45,32 @@ def test_real_contracts_resolution():
             if not awardee:
                 continue
 
-            result = resolver.resolve(awardee, parent_name=parent)
+            record = _make_record(contractor_name=awardee, legal_business_name=awardee,
+                                  parent_name=parent)
+            result = resolver.resolve(record)
             if result.get("resolved_ticker"):
                 resolved_count += 1
 
     rate = (resolved_count / test_count * 100) if test_count else 0
     print(f"\nIntegration test: {resolved_count}/{test_count} = {rate:.1f}%")
-    # In a test environment without full training data, just verify resolver doesn't crash
-    # In production, expect at least 10%
     if resolved_count > 0:
-        assert resolved_count >= test_count * 0.10  # At least 10% if any resolved
+        assert resolved_count >= test_count * 0.10
+
 
 def test_cage_code_resolution():
     """Test resolver with mock SAM.gov data (CAGE codes)."""
-    resolver = TickerResolverV3()
+    resolver = TickerResolverV4()
 
-    # Mock SAM.gov contract with CAGE code
     test_cases = [
-        {"awardee": "NORTHROP GRUMMAN CORP", "cage_code": "1WPN2", "expect_ticker": True},
-        {"awardee": "LOCKHEED MARTIN CORP", "cage_code": "04ZLA", "expect_ticker": True},
+        {"awardee": "NORTHROP GRUMMAN CORP", "cage_code": "1WPN2"},
+        {"awardee": "LOCKHEED MARTIN CORP", "cage_code": "04ZLA"},
     ]
 
     for case in test_cases:
-        result = resolver.resolve(case["awardee"], cage_code=case["cage_code"])
-        # With CAGE, we expect higher resolution rate
-        if case["expect_ticker"]:
+        record = _make_record(contractor_name=case["awardee"],
+                              legal_business_name=case["awardee"],
+                              cage_code=case["cage_code"])
+        result = resolver.resolve(record)
+        if result.get("resolved_ticker"):
             assert result["confidence"] in ["very_high", "high", "medium"], \
                 f"Expected higher confidence for {case['awardee']}"

@@ -3,6 +3,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def user_cache_dir() -> str:
+    """Return (and create) the user-level cache dir for shared API/reference data.
+
+    Stored at ~/.cache/samgovarby/ so it survives git clean / code resets.
+    Universal data (EDGAR map, market caps, CAGE→LEI, SAM entity) lives here.
+    Per-dataset data (.ticker_cache_v4.json) stays in the project directory.
+    """
+    d = os.path.join(os.path.expanduser("~"), ".cache", "samgovarby")
+    os.makedirs(d, exist_ok=True)
+    return d
+
 # API Keys
 SAM_API_KEY = os.getenv("SAM_API_KEY")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
@@ -41,6 +53,10 @@ STOP_LOSS_PCT = 0.07    # -7%
 POSITION_SIZE = 200     # $ per trade
 MAX_HOLD_DAYS = 4       # trading days
 
+# Backtest realism: slippage + commission
+SLIPPAGE_PCT = 0.005    # 0.5% adverse fill per side
+COMMISSION_PCT = 0.001  # 0.1% commission per side (0.2% round-trip)
+
 # Timezone
 TZ = "US/Eastern"
 
@@ -62,6 +78,28 @@ OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
 LEI_CACHE_TTL = 30
 TICKER_CACHE_TTL = 7
 CAGE_CACHE_TTL = 30
+
+# ─── Sole-source detection (single source of truth) ─────────────────────────
+
+SOLE_SOURCE_CODES = {"B", "C", "G", "CDO", "URG", "SP2"}
+SOLE_SOURCE_INDICATORS = {"sole source", "only one source", "one responsible source", "unique source"}
+
+
+def is_sole_source(extent_competed_code: str = "", description: str = "",
+                   num_offers: str = "", other_than_full_open: str = "") -> bool:
+    """Single source of truth for sole-source determination."""
+    if extent_competed_code.upper() in SOLE_SOURCE_CODES:
+        return True
+    if str(num_offers).strip() == "1":
+        return True
+    desc_lower = description.lower()
+    if any(ind in desc_lower for ind in SOLE_SOURCE_INDICATORS):
+        return True
+    otfo = (other_than_full_open or "").strip().upper()
+    if otfo and otfo not in ("", "NO", "N"):
+        return True
+    return False
+
 
 # Hot sectors (NAICS prefixes)
 HOT_SECTOR_NAICS = {

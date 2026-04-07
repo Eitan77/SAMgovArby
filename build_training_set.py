@@ -47,7 +47,9 @@ from config_logging import setup_logging, add_verbosity_flags
 from config import (
     MIN_CONTRACT_VALUE, MAX_AWARD_AMOUNT,
     EDGAR_RATE_LIMIT, EDGAR_8K_ENRICHMENT_DAYS, EDGAR_USER_AGENT,
+    is_sole_source,
 )
+from rate_limiter import RateLimiter
 from sam_gov_reader import read_sam_gov_csv, find_sam_gov_csv, ContractRecord
 
 # ─── Logging (initialized in main, default for module-level usage) ─────────────
@@ -71,16 +73,15 @@ CP_STAGE1 = os.path.join(CHECKPOINT_DIR, "stage1_filter.json")
 CP_STAGE2 = os.path.join(CHECKPOINT_DIR, "stage2_tickers.json")
 CP_STAGE3 = os.path.join(CHECKPOINT_DIR, "stage3_enrich.json")
 
+# Input CSV (None = auto-detect via find_sam_gov_csv)
+INPUT_CSV: str | None = None
+
 # ─── Local aliases (from config — single source of truth) ─────────────────────
 
 EDGAR_RATE_LIMIT_SEC = EDGAR_RATE_LIMIT       # seconds between EDGAR requests
 EDGAR_8K_WINDOW_DAYS = EDGAR_8K_ENRICHMENT_DAYS  # enrichment look-ahead window
 
 IDIQ_INDICATORS = ["idiq", "indefinite delivery", "indefinite quantity"]
-SOLE_SOURCE_INDICATORS = [
-    "sole source", "sole-source", "only one source",
-    "other than full", "8(a) sole",
-]
 
 EDGAR_TICKERS_URL    = "https://www.sec.gov/files/company_tickers.json"
 EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
@@ -91,15 +92,32 @@ EDGAR_HEADERS = {
 
 # ─── Shared utilities ─────────────────────────────────────────────────────────
 
-_edgar_last = 0.0
+_edgar_limiter = RateLimiter(EDGAR_RATE_LIMIT_SEC)
 
 
 def _edgar_throttle():
-    global _edgar_last
-    elapsed = time.time() - _edgar_last
-    if elapsed < EDGAR_RATE_LIMIT_SEC:
-        time.sleep(EDGAR_RATE_LIMIT_SEC - elapsed)
-    _edgar_last = time.time()
+    _edgar_limiter.wait()
+
+
+def _normalize_date(date_str: str) -> str | None:
+    """Normalize date string to YYYY-MM-DD format.
+    Accepts: YYYY-MM-DD, M/D/YYYY, MM/DD/YYYY"""
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    if '-' in date_str and len(date_str) >= 8:
+        parts = date_str.split('-')
+        if len(parts) == 3 and len(parts[0]) == 4:
+            return date_str[:10]
+    if '/' in date_str:
+        parts = date_str.split('/')
+        if len(parts) == 3:
+            m, d, y = parts
+            try:
+                return f"{y}-{int(m):02d}-{int(d):02d}"
+            except ValueError:
+                return None
+    return None
 
 
 def _elapsed(t0: float) -> str:
@@ -204,9 +222,11 @@ def _parse_bulk_row(row: dict, month_filter: int = 0) -> tuple | None:
         type_of_idc     = (row.get("type_of_idc") or "").lower()
         combined        = f"{set_aside} {contract_type} {extent_competed} {other_than_full} {idv_type} {type_of_idc}"
 
-        sole_source = (
-            any(i in combined for i in SOLE_SOURCE_INDICATORS)
-            or extent_competed in ("not competed", "not available for competition")
+        sole_source = is_sole_source(
+            extent_competed_code=row.get("extent_competed_code", ""),
+            description=combined,
+            num_offers=row.get("number_of_offers_received", ""),
+            other_than_full_open=row.get("other_than_full_and_open_competition", ""),
         )
         is_idiq = any(i in combined for i in IDIQ_INDICATORS)
 
@@ -279,7 +299,10 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[lis
     log.info("=" * 60)
     t0 = time.time()
 
-    sam_csv = find_sam_gov_csv(DATASET_DIR)
+    if INPUT_CSV:
+        sam_csv = INPUT_CSV
+    else:
+        sam_csv = find_sam_gov_csv(DATASET_DIR)
     if not sam_csv:
         log.error(f"No SAM.gov CSV found in {DATASET_DIR}/")
         log.error("Download a report from https://sam.gov/ and place it in datasets/")
@@ -420,8 +443,11 @@ def stage2_resolve_tickers(
         log.info(f"  Resuming: {already_done:,} awards already in checkpoint")
         print(f"[STAGE2_RESUME] {already_done:,} awards already resolved in checkpoint", flush=True)
 
+    print("[STAGE2_INIT] Loading EDGAR company map...", flush=True)
     edgar_map = _load_edgar_map()
+    print(f"[STAGE2_INIT] EDGAR map loaded: {len(edgar_map):,} companies. Building resolver...", flush=True)
     resolver  = TickerResolverV4(edgar_map, cache_path=TICKER_CACHE_V4_FILE)
+    print("[STAGE2_INIT] Resolver ready.", flush=True)
 
     # Deduplicate by V4 cache key: resolve once per unique entity
     def _v4_key(award: dict) -> str:
@@ -458,9 +484,15 @@ def stage2_resolve_tickers(
              f"({skipped_count:,} from checkpoint)")
 
     resolved_count = unresolved_count = 0
-    CHECKPOINT_BATCH = 200
+    CHECKPOINT_BATCH = 50
+    total_unique = len(unique_entity_keys)
+
+    print(f"[STAGE2_RESOLVING] Resolving {total_unique:,} unique entities ({skipped_count:,} from checkpoint)...", flush=True)
 
     for i, ek in enumerate(unique_entity_keys):
+        if i == 0:
+            print("[STAGE2_RESOLVING] Processing first entity...", flush=True)
+
         record = ek_to_record.get(ek)
         if record is None:
             unresolved_count += 1
@@ -482,13 +514,23 @@ def stage2_resolve_tickers(
         for ak in entity_key_to_award_keys[ek]:
             cp[ak] = entry
 
+        if i == 0:
+            print(f"[STAGE2_RESOLVING] First entity done: ticker={entry.get('ticker') or 'none'} "
+                  f"confidence={entry.get('ticker_confidence')} evidence={entry.get('evidence_type')}", flush=True)
+
         if (i + 1) % CHECKPOINT_BATCH == 0:
             _save_cp(CP_STAGE2, cp)
-            pct = (i + 1) / len(unique_entity_keys) * 100
+            pct = (i + 1) / total_unique * 100
             pct_resolved = resolved_count / (i + 1) * 100
-            log.info(f"  [{i+1:,}/{len(unique_entity_keys):,} — {pct:.1f}%] "
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            eta_s = (total_unique - i - 1) / rate if rate > 0 else 0
+            eta_min = eta_s / 60
+            log.info(f"  [{i+1:,}/{total_unique:,} — {pct:.1f}%] "
                      f"resolved={resolved_count:,} ({pct_resolved:.1f}%)  unresolved={unresolved_count:,}")
-            print(f"[STAGE2_PROGRESS] {pct:.0f}% | Resolved: {resolved_count:,} | Unresolved: {unresolved_count:,}", flush=True)
+            print(f"[STAGE2_PROGRESS] {i+1:,}/{total_unique:,} ({pct:.0f}%) | "
+                  f"Resolved: {resolved_count:,} ({pct_resolved:.0f}%) | "
+                  f"Rate: {rate:.1f}/s | ETA: {eta_min:.0f}min", flush=True)
 
     resolver.save_cache()
     _save_cp(CP_STAGE2, cp)
@@ -684,8 +726,7 @@ def _fetch_edgar_submissions(cik: str) -> dict:
 def _first_8k_info(submissions: dict, contract_date_str: str) -> tuple[str, str]:
     """Find the first 8-K within EDGAR_8K_WINDOW_DAYS after the contract date.
 
-    Returns (first_8k_date, hours_to_8k) — both empty strings if none found.
-    hours_to_8k is day-granularity (EDGAR only stores dates): days × 24.
+    Returns (first_8k_date, days_to_8k) — both empty strings if none found.
     """
     if not submissions or not contract_date_str:
         return "", ""
@@ -711,8 +752,8 @@ def _first_8k_info(submissions: dict, contract_date_str: str) -> tuple[str, str]
                     earliest_str = d
         if earliest is None:
             return "", ""
-        hours = str((earliest - contract_dt).days * 24)
-        return earliest_str, hours
+        days = str((earliest - contract_dt).days)
+        return earliest_str, days
     except Exception:
         return "", ""
 
@@ -787,11 +828,12 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
         ticker = a["ticker"]
         date_str = a.get("posted_date", "")
         if ticker and date_str:
+            norm = _normalize_date(date_str)
+            if not norm:
+                continue
             try:
-                # date_str is in M/D/YYYY format (e.g., "9/24/2021")
-                parts = date_str.split('/')
-                year = int(parts[2]) if len(parts) == 3 else int(date_str[:4])
-            except (ValueError, IndexError):
+                year = int(norm[:4])
+            except ValueError:
                 continue
             ticker_years.setdefault((ticker, year), []).append(a)
 
@@ -858,15 +900,12 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
         year_key = None
         normalized_date = None
         if ticker and date_str:
-            try:
-                # Convert M/D/YYYY or MM/DD/YYYY to YYYY-MM-DD
-                parts = date_str.split('/')
-                if len(parts) == 3:
-                    m, d, y = parts
-                    normalized_date = f"{y}-{int(m):02d}-{int(d):02d}"
-                    year_key = (ticker, int(y))
-            except (ValueError, IndexError):
-                pass
+            normalized_date = _normalize_date(date_str)
+            if normalized_date:
+                try:
+                    year_key = (ticker, int(normalized_date[:4]))
+                except ValueError:
+                    normalized_date = None
         hist_df = history_cache.get(year_key) if year_key else None
         prices = _slice_price_window(hist_df, normalized_date)
 
@@ -881,8 +920,10 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
                 current_shares=shares_cache.get(ticker, 0),
                 splits_cache=splits_cache,
             )
+        elif ticker:
+            hist_shares, shares_source = shares_cache.get(ticker, 0), "current_only"
         else:
-            hist_shares, shares_source = shares_cache.get(ticker, 0), "split_adjusted"
+            hist_shares, shares_source = 0, "missing_ticker"
         t0_price = prices.get("price_t0", 0) or 0
         hist_mcap = int(t0_price * hist_shares) if t0_price and hist_shares else 0
         if hist_mcap:
@@ -891,10 +932,12 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
         # ── EDGAR submissions (rate-limited, cached per CIK) ──────────────
         if cik and cik not in submissions_cache:
             log.debug(f"    fetching EDGAR for CIK {cik}...")
-            submissions_cache[cik] = _fetch_edgar_submissions(cik)
+            result = _fetch_edgar_submissions(cik)
+            if result:  # Only cache successful fetches
+                submissions_cache[cik] = result
         subs = submissions_cache.get(cik, {})
 
-        first_8k_date, hours_to_8k = _first_8k_info(subs, date_str)
+        first_8k_date, days_to_8k = _first_8k_info(subs, date_str)
         dilutive_date, dilutive_type = _find_last_dilutive_before_date(subs, date_str)
         log.debug(f"    first_8k={first_8k_date or 'none'}  dilutive={dilutive_date or 'none'}")
 
@@ -917,7 +960,7 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
             "shares_source":                shares_source,
             # EDGAR
             "first_8k_date":              first_8k_date,
-            "hours_to_8k":                hours_to_8k,
+            "days_to_8k":                 days_to_8k,
             "last_dilutive_filing_date":   dilutive_date,
             "dilutive_filing_type":        dilutive_type,
             # PR (not yet implemented — mark as unknown so scoring doesn't give free points)
@@ -953,7 +996,7 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
         "shares_outstanding_historical": "",
         "shares_source": "",
         "first_8k_date": "",
-        "hours_to_8k": "",
+        "days_to_8k": "",
         "last_dilutive_filing_date": "",
         "dilutive_filing_type": "",
         "first_pr_date": "",
@@ -981,11 +1024,31 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description="Build training dataset for SAMgovArby")
     add_verbosity_flags(parser)
+    parser.add_argument(
+        "--dataset", choices=["H1", "H2"], default=None,
+        help="Which half-year dataset to build: H1 (Jan–Jun) or H2 (Jul–Dec). "
+             "Sets input CSV and suffixes all output/checkpoint paths.",
+    )
     args = parser.parse_args()
 
     # Initialize logger with user's verbosity preference
     global log
     log = setup_logging("build", quiet=args.quiet, verbose=args.verbose, json_format=args.json)
+
+    # Reconfigure all paths when a specific dataset is requested
+    if args.dataset:
+        global FILTERED_CSV, STAGE2_CSV, FINAL_CSV, CHECKPOINT_DIR
+        global CP_STAGE1, CP_STAGE2, CP_STAGE3, INPUT_CSV
+        tag = args.dataset
+        INPUT_CSV      = os.path.join(DATASET_DIR, f"All2022_{tag}.csv")
+        FILTERED_CSV   = os.path.join(DATASET_DIR, f"filtered_training_set_{tag}.csv")
+        STAGE2_CSV     = os.path.join(DATASET_DIR, f"stage2_with_tickers_{tag}.csv")
+        FINAL_CSV      = os.path.join(DATASET_DIR, f"training_set_final_{tag}.csv")
+        CHECKPOINT_DIR = os.path.join(DATASET_DIR, f"checkpoints_{tag}")
+        CP_STAGE1      = os.path.join(CHECKPOINT_DIR, "stage1_filter.json")
+        CP_STAGE2      = os.path.join(CHECKPOINT_DIR, "stage2_tickers.json")
+        CP_STAGE3      = os.path.join(CHECKPOINT_DIR, "stage3_enrich.json")
+        log.info(f"Dataset: {tag}  →  {os.path.basename(INPUT_CSV)}")
 
     os.makedirs(DATASET_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -1009,7 +1072,7 @@ def main():
     final = stage3_enrich(awards, agency_history)
 
     total = _elapsed(run_start)
-    enriched = sum(1 for r in final if r.get("hours_to_8k") != "" or r.get("price_t0") != "")
+    enriched = sum(1 for r in final if r.get("days_to_8k") != "" or r.get("price_t0") != "")
     with_ticker = sum(1 for r in final if r.get("ticker"))
 
     log.info("")

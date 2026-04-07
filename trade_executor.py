@@ -2,6 +2,7 @@
 import logging
 import csv
 import os
+import warnings
 from datetime import datetime, timedelta
 import pytz
 import alpaca_trade_api as tradeapi
@@ -11,6 +12,9 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    warnings.warn("Alpaca credentials not set. Live trading will fail.", stacklevel=2)
 
 POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.csv")
 TRADE_LOG_FILE = os.path.join(os.path.dirname(__file__), "trade_log.csv")
@@ -92,11 +96,18 @@ def execute_trade(ticker, score, contract):
             qty=qty,
             side="buy",
             type="market",
-            time_in_force="day",
+            time_in_force="gtc",
             order_class="bracket",
             take_profit={"limit_price": take_profit_price},
             stop_loss={"stop_price": stop_loss_price},
         )
+
+        if not order or not getattr(order, 'id', None):
+            log.error(f"Order submission failed for {ticker}: no order ID returned")
+            return None
+        if getattr(order, 'status', '') == 'rejected':
+            log.error(f"Order rejected for {ticker}: {getattr(order, 'reject_reason', 'unknown')}")
+            return None
 
         log.info(f"TRADE PLACED: {ticker} qty={qty} @ ~${price:.2f} "
                  f"TP=${take_profit_price:.2f} SL=${stop_loss_price:.2f}")

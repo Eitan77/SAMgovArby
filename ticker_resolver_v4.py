@@ -2,9 +2,10 @@
 
 Resolution pipeline (stops at first hit):
   Tier 0: Hard rejects (non-public flags, foreign country, name regex)
-  Tier 1: CAGE → GLEIF → LEI → OpenFIGI
+  Tier 1: CAGE → GLEIF → LEI → OpenFIGI (direct identifier lookup, highest accuracy)
+           Fallback: GLEIF name search → LEI → OpenFIGI
   Tier 2: Multi-name EDGAR exact match (4 names: legal, contractor, dba, parent)
-  Tier 3: Multi-name EDGAR fuzzy match (4 names, threshold 85)
+  Tier 3: Multi-name EDGAR fuzzy match (4 names, threshold 70/75)
   Tier 4: Substring match (catch subsidiaries)
   Tier 5: Sole-source tag (num_offers == "1" or not-competed → tag for scorer)
 
@@ -14,54 +15,325 @@ Improvements over V3:
   - Business-type flags enable zero-API non-public detection
   - Cache key uses CAGE/UEI for stable identity across name variations
   - Separate cache file (.ticker_cache_v4.json) — no V3 collision
+  - Standalone: no imports from ticker_resolver_v3
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime
 
+import requests
 import yfinance as yf
 from rapidfuzz import fuzz, process
 
 from cage_resolver import CageResolver
 from lei_resolver import LeiResolver
+from sam_entity_client import SamEntityClient
 from sam_gov_reader import ContractRecord
-
-# Reuse shared EDGAR utilities from V3 (avoids duplication)
-from ticker_resolver_v3 import (
-    _load_edgar_map_default,
-    _normalize,
-    _strip_suffixes,
-    _validate_candidate,
-    _NON_PUBLIC_RE,
-)
+from config import EDGAR_RATE_LIMIT, EDGAR_USER_AGENT, user_cache_dir
 
 log = logging.getLogger(__name__)
 
 _MCAP_CACHE_WRITE_BATCH = 50
 
-# Extent Competed codes indicating no competition (sole source)
+# GLEIF circuit breaker — after this many consecutive timeouts, skip GLEIF for
+# the rest of the process session (avoids 10s hangs per entity during bulk builds)
+_GLEIF_TIMEOUT_THRESHOLD = 3
+_gleif_consecutive_timeouts = 0
+_gleif_disabled = False
+
+# ── Non-public entity patterns ────────────────────────────────────────────────
+_NON_PUBLIC_PATTERNS = [
+    r"\bUNIVERSIT",
+    r"\bREGENTS\b",
+    r"\bTRUSTEES\b",
+    r"\bBOARD OF\b",
+    r"\bNATIONAL LABORATOR",
+    r"\bDEPARTMENT OF\b",
+    r"\bBUREAU OF\b",
+    r"\bFOUNDATION\b",
+    r"\bINSTITUTE OF\b",
+    r"\bAUTHORIT[YI]",
+    r"\bTRIBAL\b",
+    r"\bCOUNTY OF\b",
+    r"\bCITY OF\b",
+    r"\bSTATE OF\b",
+    r"\bCOMMISSION\b",
+    r"\bGOVERNMENT\b",
+    r"\bMUNICIPAL",
+    r"\bCOOPERATIVE\b",
+    r"\bASSOCIATION OF\b",
+    r"\bCONSORTIUM\b",
+    r"\bJOINT VENTURE\b",
+    r"\b[A-Z]+ JV\b",
+    r"\bAJV\b",
+    r"\bBATTELLE\b",
+    r"\bSANDIA\b",
+    r"\bBROOKHAVEN\b",
+    r"\bFERMILAB\b",
+]
+_NON_PUBLIC_RE = [re.compile(p, re.IGNORECASE) for p in _NON_PUBLIC_PATTERNS]
+
+# ── Suffixes to strip ─────────────────────────────────────────────────────────
+_SUFFIX_WORDS = {
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "LLC", "LLP",
+    "LTD", "LIMITED", "CO", "COMPANY", "LP", "HOLDINGS",
+    "GROUP", "TECHNOLOGIES", "SOLUTIONS", "SYSTEMS", "SERVICES",
+    "ENTERPRISES", "GLOBAL", "USA", "US", "DBA",
+    # State of incorporation suffixes from SEC EDGAR names
+    "DE", "MD", "NV", "NY", "VA", "CA", "TX", "FL", "PA", "OH",
+    "WA", "GA", "MA", "IL", "NJ", "CT", "AZ", "CO", "MN",
+}
+
+# ── Extent Competed codes indicating no competition ───────────────────────────
 _NOT_COMPETED_CODES = {"B", "C", "G", "CDO", "URG", "SP2"}
 
+# ── Known company aliases: renames + acquisitions not in EDGAR map ────────────
+# Keys are _strip_suffixes(_normalize(name)) OR _normalize(name) for ambiguous cases.
+# Check both forms at resolution time.
+KNOWN_ALIASES: dict[str, str] = {
+    # Raytheon Technologies (RTX) predecessors
+    "RAYTHEON": "RTX",
+    "RAYTHEON BBN": "RTX",
+    "RAYTHEON INTELLIGENCE AND SPACE": "RTX",
+    "RAYTHEON MISSILES AND DEFENSE": "RTX",
+    "UNITED TECHNOLOGIES": "RTX",
+    # L3Harris (LHX) predecessors
+    "HARRIS CORPORATION": "LHX",   # normalized (CORPORATION stripped → HARRIS, too ambiguous)
+    "L3 COMMUNICATIONS": "LHX",
+    "L3HARRIS": "LHX",
+    # SAIC acquisitions
+    "ENGILITY": "SAIC",
+    # Vectrus → V2X
+    "VECTRUS": "V2X",
+}
+
+# ── SEC EDGAR endpoints ───────────────────────────────────────────────────────
+EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+EDGAR_HEADERS = {"User-Agent": EDGAR_USER_AGENT, "Accept": "application/json"}
+
+_EDGAR_TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+_EDGAR_TICKERS_FALLBACK_URL = "https://www.sec.gov/files/company_tickers.json"
+
+# Exchange tiers for common-stock preference (lower = more preferred)
+_EXCHANGE_RANK = {"Nasdaq": 0, "NYSE": 0, "NYSEArca": 1, "NYSEAmerican": 1}
+_OTC_EXCHANGE = "OTC"
+
+_edgar_last = 0.0
+
+
+def _edgar_throttle():
+    global _edgar_last
+    elapsed = time.time() - _edgar_last
+    if elapsed < EDGAR_RATE_LIMIT:
+        time.sleep(EDGAR_RATE_LIMIT - elapsed)
+    _edgar_last = time.time()
+
+
+# ── Text normalization ────────────────────────────────────────────────────────
+
+def _normalize(name: str) -> str:
+    upper = name.strip().upper()
+    upper = upper.replace("&", "AND")
+    upper = re.sub(r'[^A-Z0-9 ]', '', upper)
+    return re.sub(r' +', ' ', upper).strip()
+
+
+def _strip_suffixes(name: str) -> str:
+    words = name.split()
+    while words and words[-1] in _SUFFIX_WORDS:
+        words.pop()
+    result = " ".join(words)
+    return result if result else name
+
+
+# ── SEC Submissions validation ────────────────────────────────────────────────
+
+def _fetch_submissions_metadata(cik: str) -> dict | None:
+    if not cik:
+        return None
+    _edgar_throttle()
+    try:
+        url = EDGAR_SUBMISSIONS_URL.format(cik=str(cik).zfill(10))
+        resp = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return {
+            "name": data.get("name", ""),
+            "formerNames": data.get("formerNames", []),
+            "tickers": data.get("tickers", []),
+            "exchanges": data.get("exchanges", []),
+            "entityType": data.get("entityType", ""),
+            "sic": data.get("sic", ""),
+            "sicDescription": data.get("sicDescription", ""),
+        }
+    except Exception as e:
+        log.debug(f"Submissions fetch failed for CIK {cik}: {e}")
+        return None
+
+
+def _validate_candidate(candidate_cik: str, awardee_norm: str, awardee_stripped: str) -> tuple[bool, str, str]:
+    """Validate a candidate CIK against SEC submissions.
+
+    Returns (valid, confidence, evidence_type).
+    """
+    meta = _fetch_submissions_metadata(candidate_cik)
+    if not meta:
+        return False, "none", "validation_failed"
+
+    sec_name_norm = _normalize(meta["name"])
+    sec_name_stripped = _strip_suffixes(sec_name_norm)
+
+    if awardee_norm == sec_name_norm or awardee_stripped == sec_name_stripped:
+        return True, "high", "exact_sec_name"
+
+    score = fuzz.token_sort_ratio(awardee_stripped, sec_name_stripped)
+    if score >= 90:
+        return True, "high", "fuzzy_sec_name"
+
+    for fn in meta.get("formerNames", []):
+        fn_norm = _normalize(fn.get("name", ""))
+        fn_stripped = _strip_suffixes(fn_norm)
+        if awardee_norm == fn_norm or awardee_stripped == fn_stripped:
+            return True, "medium_high", "former_name_exact"
+        score = fuzz.token_sort_ratio(awardee_stripped, fn_stripped)
+        if score >= 85:
+            return True, "medium_high", "former_name_fuzzy"
+
+    if not meta.get("tickers"):
+        return False, "none", "no_tickers_on_file"
+
+    return False, "low", "name_mismatch"
+
+
+# ── EDGAR map loader ──────────────────────────────────────────────────────────
+
+def _load_edgar_map_default() -> dict:
+    """Load the EDGAR company→ticker map, using a persistent user-level cache.
+
+    Primary source: SEC company_tickers_exchange.json (has exchange field for
+    reliable common-stock preference over preferred/warrants).
+    Fallback: SEC company_tickers.json (no exchange field, character filtering).
+    Cache lives in ~/.cache/samgovarby/ so it survives git clean / code resets.
+    """
+    edgar_map_file = os.path.join(user_cache_dir(), "edgar_tickers.json")
+
+    if os.path.exists(edgar_map_file):
+        age_days = (time.time() - os.path.getmtime(edgar_map_file)) / 86400
+        if age_days < 7:
+            try:
+                with open(edgar_map_file) as f:
+                    data = json.load(f)
+                # Migrate legacy format (name → ticker string) to dict format
+                migrated = {}
+                for name, val in data.items():
+                    if isinstance(val, str):
+                        migrated[name] = {"ticker": val, "cik": ""}
+                    else:
+                        migrated[name] = val
+                if migrated:
+                    return migrated
+            except Exception as e:
+                log.warning(f"Could not load EDGAR map from cache: {e}")
+
+    # Primary: SEC company_tickers_exchange.json
+    # Has exchange field — prefer NYSE/Nasdaq over OTC to filter preferred stock.
+    log.info("Downloading EDGAR company tickers (with exchange) from SEC...")
+    try:
+        resp = requests.get(_EDGAR_TICKERS_EXCHANGE_URL, headers=EDGAR_HEADERS, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+        fields = raw.get("fields", [])  # ["cik", "name", "ticker", "exchange"]
+        rows = raw.get("data", [])
+        idx = {f: i for i, f in enumerate(fields)}
+
+        # Per name, track candidates and pick best: prefer listed exchanges > OTC,
+        # then no special chars, then shortest ticker.
+        candidates: dict[str, list] = {}  # name_upper → list of (exchange_rank, is_special, ticker_len, ticker, cik)
+        for row in rows:
+            cik = str(row[idx["cik"]])
+            name = row[idx["name"]].strip().upper()
+            ticker = row[idx["ticker"]].strip().upper()
+            exchange = row[idx.get("exchange", -1)] if "exchange" in idx else ""
+            if not name or not ticker:
+                continue
+            is_special = any(c in ticker for c in "-/+")
+            exrank = _EXCHANGE_RANK.get(exchange, 2) if exchange != _OTC_EXCHANGE else 3
+            entry = (exrank, int(is_special), len(ticker), ticker, cik)
+            candidates.setdefault(name, []).append(entry)
+
+        edgar_map: dict = {}
+        for name, entries in candidates.items():
+            entries.sort()  # sorts by (exrank, is_special, len, ticker, cik) — lowest wins
+            best = entries[0]
+            edgar_map[name] = {"ticker": best[3], "cik": best[4]}
+
+        with open(edgar_map_file, "w") as f:
+            json.dump(edgar_map, f)
+        log.info(f"EDGAR map (exchange-filtered) downloaded: {len(edgar_map):,} companies → {edgar_map_file}")
+        return edgar_map
+    except Exception as e:
+        log.warning(f"company_tickers_exchange.json failed ({e}), falling back to basic SEC download")
+
+    # Fallback: SEC company_tickers.json (no exchange field — use character filtering)
+    log.info("Downloading EDGAR company tickers (basic) from SEC...")
+    try:
+        resp = requests.get(_EDGAR_TICKERS_FALLBACK_URL, headers=EDGAR_HEADERS, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+        edgar_map = {}
+        for entry in raw.values():
+            name = entry.get("title", "").strip().upper()
+            ticker = entry.get("ticker", "").strip().upper()
+            cik = str(entry.get("cik_str", ""))
+            if not name or not ticker:
+                continue
+            is_special = any(c in ticker for c in "-/+")
+            if name in edgar_map:
+                existing_is_special = any(c in edgar_map[name]["ticker"] for c in "-/+")
+                if not existing_is_special:
+                    continue
+                if is_special:
+                    continue
+            edgar_map[name] = {"ticker": ticker, "cik": cik}
+        with open(edgar_map_file, "w") as f:
+            json.dump(edgar_map, f)
+        log.info(f"EDGAR map (basic) downloaded: {len(edgar_map):,} companies → {edgar_map_file}")
+        return edgar_map
+    except Exception as e:
+        log.error(f"Failed to download EDGAR tickers: {e}")
+        return {}
+
+
+# ── Main resolver ─────────────────────────────────────────────────────────────
 
 class TickerResolverV4:
     """5-tier resolver operating on ContractRecord from sam_gov_reader."""
 
     def __init__(self, edgar_map: dict | None = None,
                  cache_path: str = ".ticker_cache_v4.json",
-                 mcap_cache_path: str = ".mcap_cache.json"):
+                 mcap_cache_path: str | None = None,
+                 gleif_name_search: bool = False):
         if edgar_map is None:
             edgar_map = _load_edgar_map_default()
         self.edgar_map = edgar_map
         self.cache_path = cache_path
+        # mcap cache is universal (same data across datasets) — store in user cache dir
+        if mcap_cache_path is None:
+            mcap_cache_path = os.path.join(user_cache_dir(), "mcap_cache.json")
         self.mcap_cache_path = mcap_cache_path
         self.cache: dict = {}
         self.mcap_cache: dict = {}
         self._mcap_unsaved = 0
         self.cage_resolver = CageResolver()
         self.lei_resolver = LeiResolver()
+        self.sam_entity_client = SamEntityClient()
+        self.gleif_name_search = gleif_name_search  # disabled by default (too slow for bulk)
 
         if cache_path != ":memory:":
             self._load_cache()
@@ -75,10 +347,10 @@ class TickerResolverV4:
             s = _strip_suffixes(_normalize(ename))
             if s and s not in self._stripped_map:
                 self._stripped_map[s] = (ename, entry)
-            if s and len(s.split()) >= 2:
+            if s and len(s) >= 4:  # was >= 2 words; now catches AECOM, SAIC, CACI
                 self._substr_candidates.append((s, ename, entry))
 
-    # ── Cache I/O ────────────────────────────────────────────────────────────
+    # ── Cache I/O ─────────────────────────────────────────────────────────────
 
     def _load_cache(self):
         if os.path.exists(self.cache_path):
@@ -139,19 +411,35 @@ class TickerResolverV4:
             return self._make_result(primary_name, _normalize(primary_name),
                                      None, None, "none", "unresolved", "non_public_entity")
 
-        # Tier 1: CAGE → Company Name → GLEIF → LEI → OpenFIGI
+        # Tier 0.5: known aliases for renamed/acquired companies
+        for name in [record.legal_business_name, record.contractor_name,
+                     record.dba_name, record.parent_name]:
+            if not name.strip():
+                continue
+            norm = _normalize(name)
+            stripped = _strip_suffixes(norm)
+            for key in (stripped, norm):
+                if key in KNOWN_ALIASES:
+                    ticker = KNOWN_ALIASES[key]
+                    mc = self._get_market_cap(ticker)
+                    return self._make_result(primary_name, _normalize(primary_name),
+                                             ticker, "", "high", "known_alias", None, mc)
+
+        # Tier 1: CAGE → GLEIF → LEI → OpenFIGI (+ SAM.gov Entity API fallback)
         if record.cage_code:
             r = self._resolve_via_cage(record)
             if r.get("resolved_ticker"):
                 return r
 
-        # Names to try in Tiers 2–4 (skip empty strings)
-        names = [n for n in [
-            record.legal_business_name,
-            record.contractor_name,
-            record.dba_name,
-            record.parent_name,
-        ] if n.strip()]
+        # Names to try in Tiers 2–4: parent first (most likely SEC-registered entity),
+        # then legal, contractor, dba. Deduplicate preserving order.
+        _seen: set[str] = set()
+        names = []
+        for n in [record.parent_name, record.legal_business_name,
+                  record.contractor_name, record.dba_name]:
+            if n.strip() and n not in _seen:
+                _seen.add(n)
+                names.append(n)
 
         # Tier 2: multi-name exact match
         for name in names:
@@ -159,7 +447,7 @@ class TickerResolverV4:
             if r:
                 return r
 
-        # Tier 3: multi-name fuzzy match (lowered threshold)
+        # Tier 3: multi-name fuzzy match
         for name in names:
             r = self._fuzzy_match(name)
             if r:
@@ -169,6 +457,18 @@ class TickerResolverV4:
         for name in [record.contractor_name, record.legal_business_name]:
             if name.strip():
                 r = self._substring_match(name)
+                if r:
+                    return r
+
+        # Tier 4.5: GLEIF name search — opt-in only (slow: ~1-3s/entity even on cache miss)
+        # Disabled by default for bulk builds. Enable via gleif_name_search=True for
+        # small targeted runs (e.g. re-resolving a curated set of unresolved entities).
+        if self.gleif_name_search and not _gleif_disabled:
+            for name in names[:2]:
+                norm = _normalize(name)
+                r = self._gleif_name_to_ticker(
+                    _strip_suffixes(norm), name, norm, "gleif_name"
+                )
                 if r:
                     return r
 
@@ -182,15 +482,13 @@ class TickerResolverV4:
         return self._make_result(primary_name, _normalize(primary_name),
                                   None, None, "none", "unresolved", rejection)
 
-    # ── Tier 0: non-public detection ─────────────────────────────────────────
+    # ── Tier 0: non-public detection ──────────────────────────────────────────
 
     def _is_non_public(self, record: ContractRecord) -> bool:
-        # Defensive foreign-country check (reader already filters, but be safe)
         country = record.country_of_incorporation.upper()
         if country and country != "USA":
             return True
 
-        # Business-type flags
         if any([
             record.is_educational_institution,
             record.is_federal_agency,
@@ -201,97 +499,103 @@ class TickerResolverV4:
         ]):
             return True
 
-        # Name-regex check (universities, counties, state agencies, etc.)
         for pat in _NON_PUBLIC_RE:
             if pat.search(record.contractor_name) or pat.search(record.legal_business_name):
                 return True
 
         return False
 
-    # ── Tier 1: CAGE → Company Name → LEI → OpenFIGI ────────────────────────────
+    # ── Tier 1: CAGE → SAM.gov Entity API → EDGAR ───────────────────────────────
 
     def _resolve_via_cage(self, record: ContractRecord) -> dict:
-        """Try to resolve via CAGE code using GLEIF name search → LEI → OpenFIGI.
+        """Attempt resolution via CAGE code → SAM.gov Entity API → canonical name → EDGAR.
 
-        Note: GLEIF API requires internet connectivity. Falls back to EDGAR tiers
-        if GLEIF is unavailable.
+        CAGE→GLEIF (Path A) was removed: GLEIF's registered_as field is a company
+        registration number, not a CAGE code — audit showed 0.25% hit rate across
+        399 lookups. Calling it for every entity wasted 1-2s per entity with no gain.
         """
         if not record.cage_code:
             return {}
 
-        primary_name = record.contractor_name or record.legal_business_name
+        # CAGE → SAM.gov Entity API → canonical name → EDGAR
+        entity = self.sam_entity_client.lookup_cage(record.cage_code)
+        if entity and entity.get("legal_name"):
+            canonical = entity["legal_name"]
+            r = self._exact_match(canonical)
+            if r:
+                r["evidence_type"] = "cage_sam_" + r["evidence_type"]
+                return r
+            r = self._fuzzy_match(canonical)
+            if r:
+                r["evidence_type"] = "cage_sam_" + r["evidence_type"]
+                return r
 
-        # Build list of names to try (original + normalized variations)
-        names_to_try = []
-        for name in [record.contractor_name, record.legal_business_name, record.dba_name, record.parent_name]:
-            if name and name.strip():
-                names_to_try.append(name.strip())
-                # Also try without common suffixes
-                normalized = _strip_suffixes(_normalize(name))
-                if normalized and normalized not in names_to_try:
-                    names_to_try.append(normalized)
-
-        # If no names, Tier 1 can't proceed (fall through to Tiers 2-4)
-        if not names_to_try:
-            return {}
-
-        for name in names_to_try:
-            try:
-                import requests
-                # Try searching GLEIF by company name (try exact and partial matches)
-                for search_name in [name, name.split()[0:2]]:  # Try full name and first 2 words
-                    if isinstance(search_name, list):
-                        search_name = " ".join(search_name)
-                    if not search_name or len(search_name) < 3:
-                        continue
-
-                    params = {
-                        "filter[registered_as]": search_name,
-                        "page[size]": 5
-                    }
-                    resp = requests.get(
-                        "https://leilookup.gleif.org/api/v3/lei-records",
-                        params=params,
-                        headers={"Accept": "application/json"},
-                        timeout=10
-                    )
-
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        records = data.get("lei_records", [])
-
-                        # Try each returned LEI until one resolves to a ticker
-                        for record_item in records:
-                            lei = record_item.get("lei")
-                            if lei:
-                                # Now resolve LEI to ticker
-                                lei_result = self.lei_resolver.resolve_lei(lei)
-                                if lei_result.get("ticker"):
-                                    ticker = lei_result["ticker"]
-                                    cik = lei_result.get("cik", "")
-                                    mc = self._get_market_cap(ticker)
-                                    norm = _normalize(primary_name)
-                                    return self._make_result(primary_name, norm, ticker, cik, "high",
-                                                            "cage_gleif_lei_openfigi", None, mc)
-                    else:
-                        log.debug(f"Tier 1 GLEIF API error for '{search_name}': HTTP {resp.status_code}")
-            except requests.exceptions.ConnectionError as e:
-                # GLEIF unreachable (no internet or DNS failure) — log once, fall through
-                log.debug(f"Tier 1 GLEIF unreachable (network): {type(e).__name__}")
-                return {}
-            except requests.exceptions.Timeout:
-                log.debug(f"Tier 1 GLEIF timeout for '{name}'")
-                continue
-            except Exception as e:
-                # Unexpected error — log and continue to next name
-                log.debug(f"Tier 1 error for CAGE {record.cage_code} / '{name}': {type(e).__name__}: {e}")
-                continue
-
-        # Tier 1 could not resolve (GLEIF unavailable, no matches, or API errors)
-        # Fall through to Tiers 2-4 (EDGAR exact/fuzzy/substring)
         return {}
 
-    # ── Tier 2: multi-name EDGAR exact match ─────────────────────────────────
+    def _gleif_name_to_ticker(self, search_name: str, original_name: str,
+                               norm: str, evidence_prefix: str) -> dict | None:
+        """Search GLEIF by company name → LEI → OpenFIGI → ticker.
+
+        Tries the full name and a 2-word prefix. Returns a result dict or None.
+        Disabled for the session after repeated timeouts (circuit breaker).
+        """
+        global _gleif_disabled, _gleif_consecutive_timeouts
+        if _gleif_disabled:
+            return None
+
+        candidates = [search_name]
+        words = search_name.split()
+        if len(words) > 2:
+            candidates.append(" ".join(words[:2]))
+
+        for candidate in candidates:
+            if not candidate or len(candidate) < 3:
+                continue
+            try:
+                params = {
+                    "filter[entity.legalName.name]": candidate,
+                    "page[size]": 5,
+                }
+                resp = requests.get(
+                    "https://api.gleif.org/api/v1/lei-records",
+                    params=params,
+                    headers={"Accept": "application/json"},
+                    timeout=4,
+                )
+                _gleif_consecutive_timeouts = 0  # reset on success
+                if resp.status_code != 200:
+                    continue
+                for item in resp.json().get("data", []):
+                    lei = item.get("attributes", {}).get("lei")
+                    if not lei:
+                        continue
+                    lei_result = self.lei_resolver.resolve_lei(lei)
+                    if lei_result.get("ticker"):
+                        ticker = lei_result["ticker"]
+                        mc = self._get_market_cap(ticker)
+                        cik = lei_result.get("cik", "")
+                        return self._make_result(
+                            original_name, norm, ticker, cik,
+                            "high", f"{evidence_prefix}_lei_openfigi", None, mc,
+                        )
+            except requests.exceptions.ConnectionError:
+                log.debug("GLEIF API unreachable — disabling for session")
+                _gleif_disabled = True
+                return None
+            except requests.exceptions.Timeout:
+                _gleif_consecutive_timeouts += 1
+                log.debug(f"GLEIF timeout #{_gleif_consecutive_timeouts} for '{candidate}'")
+                if _gleif_consecutive_timeouts >= _GLEIF_TIMEOUT_THRESHOLD:
+                    _gleif_disabled = True
+                    log.warning("GLEIF API: too many timeouts — disabling for this session")
+                    return None
+                continue
+            except Exception as e:
+                log.debug(f"GLEIF name search error for '{candidate}': {e}")
+                continue
+        return None
+
+    # ── Tier 2: multi-name EDGAR exact match ──────────────────────────────────
 
     def _exact_match(self, name: str) -> dict | None:
         norm = _normalize(name)
@@ -317,19 +621,16 @@ class TickerResolverV4:
                 return self._make_result(name, norm, ticker, cik, confidence, evidence, None, mc)
         else:
             mc = self._get_market_cap(ticker)
-            if mc > 0:
-                return self._make_result(name, norm, ticker, "", "medium",
-                                          "exact_edgar_map_unverified", None, mc)
-        return None
+            return self._make_result(name, norm, ticker, "", "medium",
+                                      "exact_edgar_map_unverified", None, mc)
 
-    # ── Tier 3: multi-name fuzzy match ───────────────────────────────────────
+    # ── Tier 3: multi-name fuzzy match ────────────────────────────────────────
 
     def _fuzzy_match(self, name: str) -> dict | None:
         if not self._edgar_names:
             return None
         norm = _normalize(name)
         stripped = _strip_suffixes(norm)
-        # Lowered threshold from 80/85 to 70/75 to catch more matches
         min_score = 70 if len(stripped.split()) <= 3 else 75
 
         results = process.extract(norm, self._edgar_names,
@@ -343,9 +644,8 @@ class TickerResolverV4:
 
             if score >= 95:
                 mc = self._get_market_cap(ticker)
-                if mc > 0:
-                    return self._make_result(name, norm, ticker, cik,
-                                              "medium_high", "fuzzy_very_high", None, mc)
+                return self._make_result(name, norm, ticker, cik,
+                                          "medium_high", "fuzzy_very_high", None, mc)
 
             if cik:
                 valid, confidence, evidence = _validate_candidate(cik, norm, stripped)
@@ -354,11 +654,9 @@ class TickerResolverV4:
                     return self._make_result(name, norm, ticker, cik,
                                               confidence, f"fuzzy_{evidence}", None, mc)
             elif score >= 80:
-                # Accept without CIK validation if score is high enough
                 mc = self._get_market_cap(ticker)
-                if mc > 0:
-                    return self._make_result(name, norm, ticker, "", "low_medium",
-                                              f"fuzzy_score_{int(score)}", None, mc)
+                return self._make_result(name, norm, ticker, "", "low_medium",
+                                          f"fuzzy_score_{int(score)}", None, mc)
         return None
 
     # ── Tier 4: substring match ───────────────────────────────────────────────
@@ -379,7 +677,7 @@ class TickerResolverV4:
                 best_match = (edgar_stripped, edgar_orig, entry)
                 best_len = match_len
 
-        if not best_match or best_len < 7:
+        if not best_match or best_len < 4:  # was 7; catches AECOM (5), SAIC (4), CACI (4)
             return None
 
         edgar_stripped, _, entry = best_match
@@ -387,13 +685,17 @@ class TickerResolverV4:
         if best_len / longer < 0.5:
             return None
 
+        # Short matches must align on word boundaries to avoid false positives
+        if best_len < 7:
+            pattern = r"(?<![A-Z0-9])" + re.escape(edgar_stripped) + r"(?![A-Z0-9])"
+            if not re.search(pattern, stripped):
+                return None
+
         ticker = entry["ticker"]
         cik = entry.get("cik", "")
         mc = self._get_market_cap(ticker)
-        if mc > 0:
-            return self._make_result(name, norm, ticker, cik, "medium",
-                                      "substring_match", None, mc)
-        return None
+        return self._make_result(name, norm, ticker, cik, "medium",
+                                  "substring_match", None, mc)
 
     # ── Market cap ────────────────────────────────────────────────────────────
 
@@ -429,3 +731,52 @@ class TickerResolverV4:
             "audit_trail":        audit_trail or [],
             "last_verified":      datetime.utcnow().isoformat(),
         }
+
+
+# ── Module-level singleton (backward compat with main.py) ────────────────────
+_resolver_instance: "TickerResolverV4 | None" = None
+
+
+def resolve_ticker(awardee_name: str, edgar_results=None,
+                   resolver: "TickerResolverV4 | None" = None,
+                   cage_code: str = "") -> "tuple[str | None, str]":
+    """Resolve awardee name → (ticker_or_None, confidence_str).
+
+    Drop-in replacement for the V3 module-level function used by main.py.
+    Builds a minimal ContractRecord and delegates to TickerResolverV4.
+    """
+    global _resolver_instance
+    if resolver is None:
+        if _resolver_instance is None:
+            _resolver_instance = TickerResolverV4()
+        resolver = _resolver_instance
+
+    record = ContractRecord(
+        piid="",
+        cage_code=cage_code or "",
+        uei="",
+        country_of_incorporation="USA",
+        contractor_name=awardee_name or "",
+        legal_business_name=awardee_name or "",
+        dba_name="",
+        parent_name="",
+        parent_uei="",
+        award_amount=0.0,
+        posted_date="",
+        agency="",
+        naics_code="",
+        naics_description="",
+        set_aside_code="",
+        extent_competed_code="",
+        other_than_full_open="",
+        idv_type="",
+        num_offers="",
+        is_educational_institution=False,
+        is_federal_agency=False,
+        is_airport_authority=False,
+        is_council_of_governments=False,
+        is_community_dev_corp=False,
+        is_federally_funded_rd=False,
+    )
+    result = resolver.resolve(record)
+    return result.get("resolved_ticker"), result.get("confidence", "none")

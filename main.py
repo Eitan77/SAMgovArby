@@ -13,11 +13,11 @@ from datetime import datetime
 import pytz
 import schedule
 
-from config import SCORE_THRESHOLD, TZ, POLL_INTERVAL_HOURS
+from config import SCORE_THRESHOLD, TZ, POLL_INTERVAL_HOURS, MIN_TICKER_CONFIDENCE
 from sam_poller import fetch_recent_awards
 from filter_engine import apply_filters
 from scoring_engine import score_contract
-from ticker_resolver_v3 import resolve_ticker
+from ticker_resolver_v4 import resolve_ticker
 from trade_executor import execute_trade, check_and_exit_expired_positions
 
 # --- Logging setup ---
@@ -147,6 +147,18 @@ def run_pipeline():
             _log_signal(signal)
             continue
 
+        # Apply same confidence filter as backtest
+        _confidence_levels = ["low", "low_medium", "medium", "medium_high", "high"]
+        try:
+            min_conf_idx = _confidence_levels.index(MIN_TICKER_CONFIDENCE)
+            if confidence in _confidence_levels and _confidence_levels.index(confidence) < min_conf_idx:
+                log.info(f"SKIP {ticker}: confidence '{confidence}' below minimum '{MIN_TICKER_CONFIDENCE}'")
+                signal["trade_placed"] = False
+                _log_signal(signal)
+                continue
+        except ValueError:
+            pass  # MIN_TICKER_CONFIDENCE not in list — skip check
+
         # Step 5: Execute
         log.info(f">>> SIGNAL: {ticker} | Score: {total_score} | "
                  f"${contract['award_amount']:,.0f} | {contract['awardee_name']}")
@@ -179,6 +191,8 @@ def _award_key(contract):
         contract["awardee_name"],
         str(contract["award_amount"]),
         contract.get("posted_date", "")[:10],
+        contract.get("agency", ""),
+        contract.get("solicitation_number", ""),
     ], separators=(",", ":"))
 
 

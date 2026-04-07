@@ -4,7 +4,7 @@ import re
 import requests
 from datetime import datetime, timedelta
 import pytz
-from config import SAM_API_KEY, TZ
+from config import SAM_API_KEY, TZ, is_sole_source as _is_sole_source_fn
 
 log = logging.getLogger(__name__)
 
@@ -64,12 +64,15 @@ def _parse_award(opp):
             "awardee_name": _clean_awardee_name(awardee.get("name", "")),
             "awardee_name_raw": awardee.get("name", ""),
             "awardee_duns": awardee.get("ueiSAM", ""),
+            "cage_code": awardee.get("cageCode", ""),
             "award_amount": _parse_amount(award_data.get("amount", 0)),
             "agency": opp.get("fullParentPathName", ""),
             "office": opp.get("officeAddress", {}).get("name", "") if opp.get("officeAddress") else "",
             "naics": opp.get("naicsCode", ""),
             "set_aside": opp.get("typeOfSetAside", ""),
-            "sole_source": _is_sole_source(opp),
+            "sole_source": _is_sole_source_fn(
+                description=f"{opp.get('typeOfSetAsideDescription', '')} {opp.get('title', '')} {opp.get('description', '')}",
+            ),
             "is_idiq": _is_idiq(opp),
             "description": opp.get("description", ""),
             "sam_url": f"https://sam.gov/opp/{opp.get('noticeId', '')}/view",
@@ -138,18 +141,6 @@ def _parse_amount(val):
             return 0.0
     return 0.0
 
-
-def _is_sole_source(opp):
-    """Check if the contract was sole-source."""
-    set_aside = (opp.get("typeOfSetAsideDescription") or "").lower()
-    sol_type = (opp.get("solicitationNumber") or "").lower()
-    title = (opp.get("title") or "").lower()
-    desc = (opp.get("description") or "").lower()
-
-    indicators = ["sole source", "sole-source", "only one responsible source",
-                  "justification for other than full and open"]
-    text = f"{set_aside} {sol_type} {title} {desc}"
-    return any(ind in text for ind in indicators)
 
 
 def _is_idiq(opp):

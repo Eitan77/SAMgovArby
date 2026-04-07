@@ -5,11 +5,14 @@ Requires: pip install PyQt6 matplotlib
 """
 
 import csv
+import logging
 import os
 import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -48,6 +51,26 @@ OUTPUT_FILES = {
     "stage2":       DATASETS_DIR / "stage2_with_tickers.csv",
     "stage3":       DATASETS_DIR / "training_set_final.csv",
 }
+
+# ─── Dataset configurations ───────────────────────────────────────────────────
+
+DATASET_CONFIGS = {
+    "2022 H1  (Jan – Jun)": {
+        "tag":    "H1",
+        "input":  DATASETS_DIR / "All2022_H1.csv",
+        "stage1": DATASETS_DIR / "filtered_training_set_H1.csv",
+        "stage2": DATASETS_DIR / "stage2_with_tickers_H1.csv",
+        "stage3": DATASETS_DIR / "training_set_final_H1.csv",
+    },
+    "2022 H2  (Jul – Dec)": {
+        "tag":    "H2",
+        "input":  DATASETS_DIR / "All2022_H2.csv",
+        "stage1": DATASETS_DIR / "filtered_training_set_H2.csv",
+        "stage2": DATASETS_DIR / "stage2_with_tickers_H2.csv",
+        "stage3": DATASETS_DIR / "training_set_final_H2.csv",
+    },
+}
+DATASET_LABELS = list(DATASET_CONFIGS.keys())
 
 # ─── Dark Theme (Catppuccin Mocha) ────────────────────────────────────────────
 
@@ -426,8 +449,8 @@ class ProcessManager:
                 proc.setCreateProcessArgumentsModifier(
                     lambda a: setattr(a, "creationFlags", a.creationFlags | 0x08000000)
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Non-critical error setting process flags: {e}")
 
         if log_widget:
             proc.readyReadStandardOutput.connect(
@@ -474,8 +497,8 @@ class ProcessManager:
         for cb in self._finished_callbacks.get(name, []):
             try:
                 cb(code)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Non-critical error in finished callback: {e}")
 
 
 PROC = ProcessManager()
@@ -503,8 +526,8 @@ class CSVWatcher:
         for cb in self._callbacks.get(changed_path, []):
             try:
                 cb()
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Non-critical error in file watcher callback: {e}")
 
     def refresh_watch(self, path: Path):
         """Call after a file is created to start watching it."""
@@ -608,14 +631,6 @@ def _summary_stats(rows: list[dict]) -> dict:
     # Expectancy
     expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * abs(avg_loss))
 
-    # Sharpe ratio (assuming 252 trading days per year)
-    if len(pnls) > 1:
-        import statistics
-        std_dev = statistics.stdev(pnls)
-        sharpe = (avg_pnl / std_dev * (252 ** 0.5)) if std_dev > 0 else 0
-    else:
-        sharpe = 0
-
     # Max drawdown (cumulative approach)
     cumulative = 0
     peak = 0
@@ -647,7 +662,6 @@ def _summary_stats(rows: list[dict]) -> dict:
         "avg_loss":            avg_loss,
         "profit_factor":       profit_factor,
         "expectancy":          expectancy,
-        "sharpe_ratio":        sharpe,
         "max_drawdown":        max_dd,
         "avg_peak_intraday":   avg_peak_intraday,
         "avg_7day_return":     avg_7day_return,
@@ -868,6 +882,8 @@ class LivePipelineTab(QWidget):
 
     def _on_pipeline_finished(self, code: int):
         self._set_running(False)
+        if code != 0:
+            log.error(f"Pipeline process exited with code {code}")
 
     def _set_running(self, running: bool):
         self._btn_start.setEnabled(not running)
@@ -1032,11 +1048,13 @@ class BacktestTab(QWidget):
         pf.addRow("Threshold:",   self._threshold)
         lv.addWidget(self._params_box)
 
-        # Dataset label (always uses training_set_final.csv)
-        ds_lbl = QLabel(f"Dataset: training_set_final.csv")
-        ds_lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
-        ds_lbl.setWordWrap(True)
-        lv.addWidget(ds_lbl)
+        # Dataset selector
+        ds_box = QGroupBox("Dataset")
+        dbl = QVBoxLayout(ds_box)
+        self._dataset_combo = QComboBox()
+        self._dataset_combo.addItems(DATASET_LABELS)
+        dbl.addWidget(self._dataset_combo)
+        lv.addWidget(ds_box)
 
         self._run_btn = QPushButton("▶  Run Backtest")
         self._run_btn.setObjectName("run_btn")
@@ -1121,16 +1139,17 @@ class BacktestTab(QWidget):
             pass
         best = rows[0]
         try: self._tp.setValue(float(best.get("tp_pct", 8.0)) / 100)  # stored as 8.0, convert to 0.08
-        except Exception: pass
+        except Exception as e: log.warning(f"Non-critical error setting tp value: {e}")
         try: self._sl.setValue(float(best.get("sl_pct", 7.0)) / 100)
-        except Exception: pass
+        except Exception as e: log.warning(f"Non-critical error setting sl value: {e}")
         try: self._hold.setValue(int(float(best.get("max_hold_days", 4))))
-        except Exception: pass
+        except Exception as e: log.warning(f"Non-critical error setting hold value: {e}")
         try: self._threshold.setValue(int(float(best.get("score_threshold", 40))))
-        except Exception: pass
+        except Exception as e: log.warning(f"Non-critical error setting threshold value: {e}")
 
     def _run_backtest(self):
-        training_csv = str(OUTPUT_FILES["stage3"])
+        ds = DATASET_CONFIGS[self._dataset_combo.currentText()]
+        training_csv = str(ds["stage3"])
         args = [
             "-u",  # unbuffered output
             str(SCRIPTS_DIR / "backtest.py"),
@@ -1140,9 +1159,9 @@ class BacktestTab(QWidget):
             "--sl",        str(self._sl.value()),
             "--hold",      str(self._hold.value()),
             "--threshold", str(self._threshold.value()),
-            "--max-market-cap", str(self._optimizer_max_mcap_m * 1_000_000),  # convert M to full value
+            "--max-market-cap", str(self._optimizer_max_mcap_m * 1_000_000),
         ]
-        if OUTPUT_FILES["stage3"].exists():
+        if ds["stage3"].exists():
             args += ["--training-csv", training_csv]
 
         self._run_btn.setEnabled(False)
@@ -1227,7 +1246,6 @@ class BacktestTab(QWidget):
             row4 = QHBoxLayout()
             row4.setSpacing(6)
             for label, value, color in [
-                ("Sharpe Ratio",    f"{stats['sharpe_ratio']:.2f}",         "#a6e3a1" if stats["sharpe_ratio"] > 1 else "#f38ba8"),
                 ("Profit Factor",   f"{stats['profit_factor']:.2f}x",       "#a6e3a1" if stats["profit_factor"] > 1 else "#f38ba8"),
                 ("Max Drawdown",    f"-{stats['max_drawdown']:.2f}%",        "#f38ba8"),
                 ("Expectancy",      f"{stats['expectancy']:+.2f}%",         "#a6e3a1" if stats["expectancy"] >= 0 else "#f38ba8"),
@@ -1423,10 +1441,11 @@ class OptimizerTab(QWidget):
         sf = QVBoxLayout(settings)
         sf.setSpacing(8)
 
-        # Data range — full dataset
-        yr_lbl = QLabel("Data Range: Full dataset (All awards 2000–2099)")
-        yr_lbl.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
-        sf.addWidget(yr_lbl)
+        # Dataset selector
+        sf.addWidget(QLabel("Dataset:"))
+        self._dataset_combo = QComboBox()
+        self._dataset_combo.addItems(DATASET_LABELS)
+        sf.addWidget(self._dataset_combo)
 
         lv.addWidget(settings)
 
@@ -1484,7 +1503,8 @@ class OptimizerTab(QWidget):
         self._best_row: dict = {}
 
     def _run_optimizer(self):
-        csv_path = str(OUTPUT_FILES["stage3"])
+        ds = DATASET_CONFIGS[self._dataset_combo.currentText()]
+        csv_path = str(ds["stage3"])
         args = [
             "-u",  # unbuffered output
             str(SCRIPTS_DIR / "optimizer.py"),
@@ -1557,7 +1577,6 @@ class OptimizerTab(QWidget):
             ("Win Rate",      f"{float(best.get('win_rate', 0)):.1f}%",
                                "#a6e3a1" if wr >= 50 else "#f38ba8"),
             ("Trades",        _val("trades"),               "#cdd6f4"),
-            ("Sharpe",        f"{float(best.get('sharpe', 0)):.2f}",  "#89b4fa"),
             ("Expectancy",    f"{float(best.get('expectancy', 0)):+.2f}%", "#cdd6f4"),
         ]:
             row2.addWidget(_make_stat_card(label, value, color))
@@ -1602,6 +1621,10 @@ class TrainingDataTab(QWidget):
         self._setup_watchers()
         self._refresh_status()
 
+    def _ds(self) -> dict:
+        """Return the currently selected dataset config dict."""
+        return DATASET_CONFIGS[self._dataset_combo.currentText()]
+
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -1617,6 +1640,17 @@ class TrainingDataTab(QWidget):
         info.setStyleSheet("color: #a6adc8; font-size: 12px;")
         root.addWidget(info)
 
+        # Dataset selector
+        ds_row = QHBoxLayout()
+        ds_row.addWidget(QLabel("Dataset:"))
+        self._dataset_combo = QComboBox()
+        self._dataset_combo.addItems(DATASET_LABELS)
+        self._dataset_combo.setFixedWidth(220)
+        self._dataset_combo.currentIndexChanged.connect(self._refresh_status)
+        ds_row.addWidget(self._dataset_combo)
+        ds_row.addStretch()
+        root.addLayout(ds_row)
+
         stages_row = QHBoxLayout()
         stages_row.setSpacing(10)
 
@@ -1626,7 +1660,8 @@ class TrainingDataTab(QWidget):
         self._s1_status = QLabel("Checking...")
         self._s1_status.setObjectName("status_missing")
         self._s1_status.setWordWrap(True)
-        s1l.addWidget(QLabel("Source: SAM.gov FirstReport.csv  |  Output: filtered_training_set.csv"))
+        self._s1_label = QLabel()
+        s1l.addWidget(self._s1_label)
         s1l.addWidget(QLabel("Filters: $1M–$10B • Remove IDV/IDIQ"))
         s1l.addWidget(self._s1_status)
         self._btn_s1 = QPushButton("▶  Run Build (all stages)")
@@ -1641,8 +1676,9 @@ class TrainingDataTab(QWidget):
         self._s2_status = QLabel("Checking...")
         self._s2_status.setObjectName("status_missing")
         self._s2_status.setWordWrap(True)
-        s2l.addWidget(QLabel("Output: stage2_with_tickers.csv"))
-        s2l.addWidget(QLabel("Tiers: CAGE→LEI→GLEIF • EDGAR exact/fuzzy • Substring • Sole-source"))
+        self._s2_label = QLabel()
+        s2l.addWidget(self._s2_label)
+        s2l.addWidget(QLabel("Tiers: CAGE→SAM→EDGAR • GLEIF/LEI • Fuzzy • Substring"))
         s2l.addWidget(self._s2_status)
         self._btn_s2 = QPushButton("⟳  Resume Build")
         self._btn_s2.clicked.connect(lambda: self._run_build("build"))
@@ -1655,7 +1691,8 @@ class TrainingDataTab(QWidget):
         self._s3_status = QLabel("Checking...")
         self._s3_status.setObjectName("status_missing")
         self._s3_status.setWordWrap(True)
-        s3l.addWidget(QLabel("Output: training_set_final.csv"))
+        self._s3_label = QLabel()
+        s3l.addWidget(self._s3_label)
         s3l.addWidget(QLabel("Data: OHLC prices • Shares outstanding • Historical mcap • 8-K filings"))
         s3l.addWidget(self._s3_status)
         self._btn_s3 = QPushButton("▶  Enrich OHLC")
@@ -1678,33 +1715,44 @@ class TrainingDataTab(QWidget):
         root.addWidget(log_box)
 
     def _setup_watchers(self):
-        for key in ("stage1", "stage2", "stage3"):
-            WATCHER.watch(OUTPUT_FILES[key], self._refresh_status)
+        for cfg in DATASET_CONFIGS.values():
+            for key in ("stage1", "stage2", "stage3"):
+                WATCHER.watch(cfg[key], self._refresh_status)
 
     def _refresh_status(self):
-        for key, lbl in [("stage1", self._s1_status), ("stage2", self._s2_status), ("stage3", self._s3_status)]:
-            path = OUTPUT_FILES[key]
+        ds = self._ds()
+        pairs = [
+            (ds["stage1"], self._s1_status, self._s1_label,
+             f"Source: {ds['input'].name}  →  {ds['stage1'].name}"),
+            (ds["stage2"], self._s2_status, self._s2_label,
+             f"Output: {ds['stage2'].name}"),
+            (ds["stage3"], self._s3_status, self._s3_label,
+             f"Output: {ds['stage3'].name}"),
+        ]
+        for path, status_lbl, file_lbl, file_text in pairs:
+            file_lbl.setText(file_text)
+            file_lbl.setStyleSheet("color: #a6adc8; font-size: 11px;")
             if path.exists():
-                lbl.setText(_file_stat(path))
-                lbl.setStyleSheet("color: #a6e3a1;")
+                status_lbl.setText(_file_stat(path))
+                status_lbl.setStyleSheet("color: #a6e3a1;")
             else:
-                lbl.setText("Not found")
-                lbl.setStyleSheet("color: #f38ba8;")
+                status_lbl.setText("Not found")
+                status_lbl.setStyleSheet("color: #f38ba8;")
             WATCHER.refresh_watch(path)
 
     def _run_build(self, name: str):
         self._set_building(True)
-        args = [str(SCRIPTS_DIR / "build_training_set.py"), "--quiet"]
+        args = [str(SCRIPTS_DIR / "build_training_set.py"), "--quiet",
+                "--dataset", self._ds()["tag"]]
         PROC.start(name, args, log_widget=self._log, on_finished=self._on_finished)
 
     def _run_enrich(self):
-        stage3 = OUTPUT_FILES["stage3"]
+        stage3 = self._ds()["stage3"]
         if not stage3.exists():
             QMessageBox.warning(self, "Missing file",
-                                "training_set_final.csv not found. Run the build first.")
+                                f"{stage3.name} not found. Run the build first.")
             return
 
-        # Check if already enriched by looking for price columns
         try:
             with open(stage3) as f:
                 reader = csv.DictReader(f)

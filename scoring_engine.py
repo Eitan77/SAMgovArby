@@ -42,7 +42,12 @@ def score_contract(contract, market_cap, agency_history=None, threshold=None,
     breakdown["value_to_mcap"] = {"points": pts, "max": w["value_to_mcap"], "ratio": round(ratio * 100, 2)}
 
     # Factor 2: Sole-source (max w["sole_source"] pts)
-    pts = w["sole_source"] if contract.get("sole_source") else 0
+    sole_source_val = contract.get("sole_source")
+    if isinstance(sole_source_val, str):
+        sole_source = sole_source_val.lower() in ("true", "1", "yes")
+    else:
+        sole_source = bool(sole_source_val)
+    pts = w["sole_source"] if sole_source else 0
     breakdown["sole_source"] = {"points": pts, "max": w["sole_source"]}
 
     # Factor 3: First-time agency win (max w["first_agency"] pts)
@@ -52,10 +57,10 @@ def score_contract(contract, market_cap, agency_history=None, threshold=None,
     agency = contract.get("agency", "")
     if is_first_agency_win is not None:
         pts = w["first_agency"] if is_first_agency_win else 0
-    elif agency_history is not None:
+    elif agency and agency_history is not None:
         pts = w["first_agency"] if agency not in agency_history else 0
     else:
-        pts = 0  # unknown in live mode — conservative
+        pts = 0  # unknown or empty agency — conservative
     breakdown["first_time_agency"] = {"points": pts, "max": w["first_agency"]}
 
     # Factor 4: Hot sector (max w["hot_sector"] pts)
@@ -63,7 +68,7 @@ def score_contract(contract, market_cap, agency_history=None, threshold=None,
     if naics in HOT_SECTOR_NAICS:
         pts = w["hot_sector"]
     elif naics.startswith(GENERAL_DEFENSE_NAICS_PREFIX):
-        pts = int(w["hot_sector"] * 0.53)  # 8 of 15
+        pts = round(w["hot_sector"] * 0.53)  # 8 of 15
     else:
         pts = 0
     breakdown["hot_sector"] = {"points": pts, "max": w["hot_sector"], "naics": naics}

@@ -54,6 +54,7 @@ def _base_row(**overrides) -> dict:
         "Ultimate Parent Unique Entity ID": "PARENT123456",
         "Country of Incorporation": "USA",
         "Base and All Options Value (Total Contract Value)": "5000000.00",
+        "Date Signed": "2023-03-15",
         "Period of Performance Start Date": "2023-03-15",
         "Contracting Agency Name": "DEPT OF DEFENSE",
         "NAICS Code": "336411",

@@ -5,11 +5,13 @@ uniquely identifies legal entities. This resolver maps LEIs to stock
 tickers via OpenFIGI (Bloomberg's open symbology) and validates via GLEIF.
 """
 import logging
+import os
 import re
 import requests
 from typing import Optional
 from rapidfuzz import fuzz
 from api_cache import ApiCache
+from config import user_cache_dir
 
 log = logging.getLogger(__name__)
 
@@ -17,7 +19,7 @@ OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
 GLEIF_LEI_URL = "https://leilookup.gleif.org/api/v3/lei-records"
 HEADERS = {"Accept": "application/json"}
 
-_lei_cache = ApiCache(cache_file=".lei_ticker_cache.json")
+_lei_cache = ApiCache(cache_file=os.path.join(user_cache_dir(), "lei_ticker_cache.json"))
 
 
 def is_valid_lei(lei: str) -> bool:

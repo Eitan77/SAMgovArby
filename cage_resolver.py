@@ -6,17 +6,19 @@ contractors. This resolver maps them to Legal Entity Identifiers (LEI) via
 the GLEIF API.
 """
 import logging
+import os
 import re
 import requests
 from typing import Optional
 from api_cache import ApiCache
+from config import user_cache_dir
 
 log = logging.getLogger(__name__)
 
 GLEIF_SEARCH_URL = "https://leilookup.gleif.org/api/v3/lei-records"
 GLEIF_HEADERS = {"Accept": "application/json"}
 
-_cage_cache = ApiCache(cache_file=".cage_lei_cache.json")
+_cage_cache = ApiCache(cache_file=os.path.join(user_cache_dir(), "cage_lei_cache.json"))
 
 
 def is_valid_cage_code(cage: str) -> bool:
