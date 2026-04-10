@@ -73,6 +73,10 @@ CP_STAGE1 = os.path.join(CHECKPOINT_DIR, "stage1_filter.json")
 CP_STAGE2 = os.path.join(CHECKPOINT_DIR, "stage2_tickers.json")
 CP_STAGE3 = os.path.join(CHECKPOINT_DIR, "stage3_enrich.json")
 
+# ── Checkpoint toggle ─────────────────────────────────────────────────────────
+# Set to True to disable checkpoint read/write (always builds fresh).
+DISABLE_CHECKPOINTS = True
+
 # Input CSV (None = auto-detect via find_sam_gov_csv)
 INPUT_CSV: str | None = None
 
@@ -128,6 +132,8 @@ def _elapsed(t0: float) -> str:
 
 
 def _load_cp(path: str) -> dict:
+    if DISABLE_CHECKPOINTS:
+        return {}
     if os.path.exists(path):
         try:
             with open(path) as f:
@@ -138,6 +144,8 @@ def _load_cp(path: str) -> dict:
 
 
 def _save_cp(path: str, data: dict):
+    if DISABLE_CHECKPOINTS:
+        return
     with open(path, "w") as f:
         json.dump(data, f)
 

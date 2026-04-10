@@ -148,17 +148,78 @@ NON_PUBLIC_PATTERNS = [
 NOT_COMPETED_CODES = {"B", "C", "G", "CDO", "URG", "SP2"}
 
 # Known company aliases: renames + acquisitions not in EDGAR map.
+# Keys must be normalized (uppercase, no punctuation) stripped names.
+# Covers: (1) EDGAR cache wrong-ticker entries, (2) post-acquisition renames,
+# (3) subsidiaries commonly appearing in SAM.gov by a different name than the parent SEC filer.
 KNOWN_ALIASES: dict[str, str] = {
-    "RAYTHEON":                       "RTX",
-    "RAYTHEON BBN":                   "RTX",
-    "RAYTHEON INTELLIGENCE AND SPACE":"RTX",
-    "RAYTHEON MISSILES AND DEFENSE":  "RTX",
-    "UNITED TECHNOLOGIES":            "RTX",
-    "HARRIS CORPORATION":             "LHX",
-    "L3 COMMUNICATIONS":              "LHX",
-    "L3HARRIS":                       "LHX",
-    "ENGILITY":                       "SAIC",
-    "VECTRUS":                        "V2X",
+    # ── Raytheon / RTX family ──────────────────────────────────────────────────
+    "RAYTHEON":                           "RTX",
+    "RAYTHEON BBN":                       "RTX",
+    "RAYTHEON INTELLIGENCE AND SPACE":    "RTX",
+    "RAYTHEON MISSILES AND DEFENSE":      "RTX",
+    "UNITED TECHNOLOGIES":                "RTX",
+    "COLLINS AEROSPACE":                  "RTX",
+    "PRATT AND WHITNEY":                  "RTX",
+
+    # ── L3Harris family ───────────────────────────────────────────────────────
+    "HARRIS CORPORATION":                 "LHX",
+    "L3 COMMUNICATIONS":                  "LHX",
+    "L3HARRIS":                           "LHX",
+    "L3HARRIS TECHNOLOGIES":              "LHX",
+    "L3 TECHNOLOGIES":                    "LHX",
+
+    # ── SAIC family ───────────────────────────────────────────────────────────
+    "ENGILITY":                           "SAIC",
+    "SCIENCE APPLICATIONS INTERNATIONAL": "SAIC",
+
+    # ── V2X family ────────────────────────────────────────────────────────────
+    "VECTRUS":                            "V2X",
+    "VERTEX AEROSPACE":                   "V2X",
+
+    # ── Boeing — EDGAR cache has wrong ticker BA-PA (preferred share) ─────────
+    "BOEING":                             "BA",
+    "BOEING COMPANY":                     "BA",
+    "BOEING DEFENSE SPACE AND SECURITY":  "BA",
+    "BOEING INTELLIGENCE AND ANALYTICS":  "BA",
+
+    # ── Jacobs — renamed from Jacobs Engineering Group to Jacobs Solutions ────
+    "JACOBS ENGINEERING GROUP":           "J",
+    "JACOBS ENGINEERING":                 "J",
+    "JACOBS TECHNOLOGY":                  "J",
+    "JACOBS GOVERNMENT SERVICES":         "J",
+
+    # ── Leidos family ─────────────────────────────────────────────────────────
+    "LEIDOS":                             "LDOS",
+    "LEIDOS INNOVATIONS":                 "LDOS",
+    "LEIDOS HEALTH":                      "LDOS",
+    "LEIDOS HOLDINGS":                    "LDOS",
+    "SCIENCE AND TECHNOLOGY ASSOCIATES":  "LDOS",  # legacy Leidos entity
+
+    # ── ManTech — was public (MANT) through late 2022 ────────────────────────
+    "MANTECH":                            "MANT",
+    "MANTECH INTERNATIONAL":              "MANT",
+    "MANTECH ADVANCED SYSTEMS":           "MANT",
+
+    # ── ICF International ─────────────────────────────────────────────────────
+    "ICF INTERNATIONAL":                  "ICFI",
+    "ICF INCORPORATED":                   "ICFI",
+
+    # ── Tetra Tech ────────────────────────────────────────────────────────────
+    "TETRA TECH":                         "TTEK",
+
+    # ── Amentum (spun off from AECOM in 2020, IPO 2024) ──────────────────────
+    "AMENTUM":                            "AMTM",
+    "AMENTUM SERVICES":                   "AMTM",
+
+    # ── DXC Technology (CSC + HP Enterprise Services merger 2017) ────────────
+    "DXC TECHNOLOGY":                     "DXC",
+    "COMPUTER SCIENCES CORPORATION":      "DXC",
+    "CSC GOVERNMENT SOLUTIONS":           "DXC",
+
+    # ── Peraton / Perspecta — Perspecta (PRSP) was public until May 2021 ─────
+    "PERSPECTA":                          "PRSP",
+    "PERSPECTA ENTERPRISE SOLUTIONS":     "PRSP",
+    "PERSPECTA LABS":                     "PRSP",
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────

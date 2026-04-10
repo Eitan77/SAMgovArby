@@ -1767,11 +1767,13 @@ class TrainingDataTab(QWidget):
     def _make_stats_label() -> QLabel:
         lbl = QLabel("No data yet")
         lbl.setStyleSheet(
-            "color: #a6adc8; font-size: 11px; font-family: monospace;"
-            "background: #181825; border-radius: 4px; padding: 6px;"
+            "color: #cdd6f4; font-size: 13px;"
+            "background: #181825; border-radius: 4px; padding: 8px;"
         )
-        lbl.setWordWrap(False)
+        lbl.setWordWrap(True)
         lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         return lbl
 
     def _refresh_stats(self):
@@ -1779,6 +1781,30 @@ class TrainingDataTab(QWidget):
         ds    = self._ds()
         tag   = ds["tag"]
         cpdir = DATASETS_DIR / f"checkpoints_{tag}"
+
+        SEP   = "<tr><td colspan='3'><span style='color:#313244'>─────────────────────────────────────────</span></td></tr>"
+        HDR   = "style='color:#89b4fa; font-weight:bold; padding-top:4px;'"
+        VAL   = "style='text-align:right; font-weight:bold; padding-left:8px;'"
+        PCT   = "style='text-align:right; color:#6c7086; padding-left:8px;'"
+        OUT   = "style='color:#a6e3a1; font-weight:bold;'"
+        OUTV  = "style='text-align:right; color:#a6e3a1; font-weight:bold; padding-left:8px;'"
+        OUTP  = "style='text-align:right; color:#a6e3a1; padding-left:8px;'"
+
+        def tbl(rows_html: str) -> str:
+            return (
+                "<table width='100%' cellspacing='0' cellpadding='2' "
+                "style='font-size:13px;'>"
+                + rows_html +
+                "</table>"
+            )
+
+        def row(label: str, val: str, pct_str: str = "",
+                lsty: str = "", vsty: str = VAL, psty: str = PCT) -> str:
+            p = f"<td {psty}>{pct_str}</td>" if pct_str else "<td></td>"
+            return f"<tr><td {lsty}>{label}</td><td {vsty}>{val}</td>{p}</tr>"
+
+        def subhdr(text: str) -> str:
+            return f"<tr><td colspan='3' {HDR}>{text}</td></tr>"
 
         # ── Stage 1 ──────────────────────────────────────────────────────────
         try:
@@ -1790,20 +1816,19 @@ class TrainingDataTab(QWidget):
             amount  = s1.get("rows_removed_amount", 0)
             passed  = s1.get("final_count", 0)
 
-            def pct1(n):
-                return f"{n / total * 100:5.1f}%" if total else "  —  "
+            def p1(n): return f"({n / total * 100:.1f}%)" if total else ""
 
-            self._s1_stats.setText(
-                f"Total rows read  : {total:>8,}<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"Removed (foreign): {foreign:>8,}  ({pct1(foreign)})<br>"
-                f"Removed (IDV)    : {idv:>8,}  ({pct1(idv)})<br>"
-                f"Removed (amount) : {amount:>8,}  ({pct1(amount)})<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"<span style='color:#a6e3a1'>→ Into Stage 2   : {passed:>8,}  ({pct1(passed)})</span>"
-            )
+            self._s1_stats.setText(tbl(
+                row("Total rows read", f"{total:,}") +
+                SEP +
+                row("Removed (foreign)", f"{foreign:,}", p1(foreign)) +
+                row("Removed (IDV)", f"{idv:,}", p1(idv)) +
+                row("Removed (amount)", f"{amount:,}", p1(amount)) +
+                SEP +
+                row("→ Into Stage 2", f"{passed:,}", p1(passed), OUT, OUTV, OUTP)
+            ))
         except Exception:
-            self._s1_stats.setText("<span style='color:#585b70'>No data yet</span>")
+            self._s1_stats.setText("<span style='color:#585b70; font-size:13px;'>No data yet</span>")
 
         # ── Stage 2 ──────────────────────────────────────────────────────────
         try:
@@ -1813,37 +1838,36 @@ class TrainingDataTab(QWidget):
             resolved = sum(1 for v in s2.values() if v.get("ticker"))
             unres    = total2 - resolved
 
-            def pct2(n):
-                return f"{n / total2 * 100:5.1f}%" if total2 else "  —  "
-
-            def rpct(n):
-                return f"{n / resolved * 100:5.1f}%" if resolved else "  —  "
+            def p2(n): return f"({n / total2 * 100:.1f}%)" if total2 else ""
+            def rp(n): return f"({n / resolved * 100:.1f}%)" if resolved else ""
 
             confs = Counter(v.get("ticker_confidence", "") for v in s2.values())
             evids = Counter(v.get("evidence_type", "")     for v in s2.values())
 
-            self._s2_stats.setText(
-                f"Total awards     : {total2:>8,}<br>"
-                f"Resolved         : {resolved:>8,}  ({pct2(resolved)})<br>"
-                f"Unresolved       : {unres:>8,}  ({pct2(unres)})<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"By confidence (resolved):<br>"
-                f"&nbsp;&nbsp;High       : {confs.get('high', 0):>6,}  ({rpct(confs.get('high', 0))})<br>"
-                f"&nbsp;&nbsp;Medium     : {confs.get('medium', 0):>6,}  ({rpct(confs.get('medium', 0))})<br>"
-                f"&nbsp;&nbsp;Low-medium : {confs.get('low_medium', 0):>6,}  ({rpct(confs.get('low_medium', 0))})<br>"
-                f"&nbsp;&nbsp;Low        : {confs.get('low', 0):>6,}<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"By evidence type:<br>"
-                f"&nbsp;&nbsp;SEC exact  : {evids.get('sec_exact', 0):>6,}<br>"
-                f"&nbsp;&nbsp;Known alias: {evids.get('known_alias', 0):>6,}<br>"
-                f"&nbsp;&nbsp;Non-public : {evids.get('null:non_public_entity', 0):>6,}<br>"
-                f"&nbsp;&nbsp;Low score  : {evids.get('null:low_score', 0):>6,}<br>"
-                f"&nbsp;&nbsp;No match   : {evids.get('none', 0):>6,}<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"<span style='color:#a6e3a1'>→ Into Stage 3   : {resolved:>8,}</span>"
-            )
+            IND = "style='padding-left:14px;'"
+
+            self._s2_stats.setText(tbl(
+                row("Total awards", f"{total2:,}") +
+                row("Resolved", f"{resolved:,}", p2(resolved)) +
+                row("Unresolved", f"{unres:,}", p2(unres)) +
+                SEP +
+                subhdr("By confidence (resolved):") +
+                row("High", f"{confs.get('high', 0):,}", rp(confs.get('high', 0)), IND) +
+                row("Medium", f"{confs.get('medium', 0):,}", rp(confs.get('medium', 0)), IND) +
+                row("Low-medium", f"{confs.get('low_medium', 0):,}", rp(confs.get('low_medium', 0)), IND) +
+                row("Low", f"{confs.get('low', 0):,}", "", IND) +
+                SEP +
+                subhdr("By evidence type:") +
+                row("SEC exact", f"{evids.get('sec_exact', 0):,}", "", IND) +
+                row("Known alias", f"{evids.get('known_alias', 0):,}", "", IND) +
+                row("Non-public", f"{evids.get('null:non_public_entity', 0):,}", "", IND) +
+                row("Low score", f"{evids.get('null:low_score', 0):,}", "", IND) +
+                row("No match", f"{evids.get('none', 0):,}", "", IND) +
+                SEP +
+                row("→ Into Stage 3", f"{resolved:,}", "", OUT, OUTV)
+            ))
         except Exception:
-            self._s2_stats.setText("<span style='color:#585b70'>No data yet</span>")
+            self._s2_stats.setText("<span style='color:#585b70; font-size:13px;'>No data yet</span>")
 
         # ── Stage 3 ──────────────────────────────────────────────────────────
         try:
@@ -1857,27 +1881,26 @@ class TrainingDataTab(QWidget):
             except Exception:
                 qualifying = enriched
 
-            def pct3(n):
-                return f"{n / qualifying * 100:5.1f}%" if qualifying else "  —  "
+            def p3(n): return f"({n / qualifying * 100:.1f}%)" if qualifying else ""
 
             with_ohlc     = sum(1 for v in s3.values() if v.get("price_t0") not in ("", None))
             with_8k       = sum(1 for v in s3.values() if v.get("first_8k_date") not in ("", None))
             with_dilutive = sum(1 for v in s3.values() if v.get("last_dilutive_filing_date") not in ("", None))
             with_mcap     = sum(1 for v in s3.values() if v.get("historical_market_cap_approx") not in ("", None))
 
-            self._s3_stats.setText(
-                f"Qualifying (ticker)  : {qualifying:>6,}<br>"
-                f"Enriched             : {enriched:>6,}  ({pct3(enriched)})<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"With OHLC prices     : {with_ohlc:>6,}  ({pct3(with_ohlc)})<br>"
-                f"With 8-K filing      : {with_8k:>6,}  ({pct3(with_8k)})<br>"
-                f"With dilutive filing : {with_dilutive:>6,}  ({pct3(with_dilutive)})<br>"
-                f"With hist market cap : {with_mcap:>6,}  ({pct3(with_mcap)})<br>"
-                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
-                f"<span style='color:#a6e3a1'>→ Final dataset  : {enriched:>7,}</span>"
-            )
+            self._s3_stats.setText(tbl(
+                row("Qualifying (ticker)", f"{qualifying:,}") +
+                row("Enriched", f"{enriched:,}", p3(enriched)) +
+                SEP +
+                row("With OHLC prices", f"{with_ohlc:,}", p3(with_ohlc)) +
+                row("With 8-K filing", f"{with_8k:,}", p3(with_8k)) +
+                row("With dilutive filing", f"{with_dilutive:,}", p3(with_dilutive)) +
+                row("With hist market cap", f"{with_mcap:,}", p3(with_mcap)) +
+                SEP +
+                row("→ Final dataset", f"{enriched:,}", "", OUT, OUTV)
+            ))
         except Exception:
-            self._s3_stats.setText("<span style='color:#585b70'>No data yet</span>")
+            self._s3_stats.setText("<span style='color:#585b70; font-size:13px;'>No data yet</span>")
 
     def _run_build(self, name: str):
         self._set_building(True)

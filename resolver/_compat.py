@@ -30,9 +30,10 @@ class TickerResolverV4:
         from resolver.persistence import ensure_dirs, init_sqlite_cache
 
         self.config = load_config()
-        # Disable live SEC HTTP fallback for bulk builds — it rate-limits to ~0.12s/req
-        # and kills throughput on large entity sets. EDGAR map handles >90% of cases.
-        self.config.source_policies.allow_sec_live_fallback = False
+        # SEC live fallback: only fires for entities that scored below threshold from the
+        # static EDGAR map — already-resolved entities are never hit. Cost: ~0.12s/req
+        # for low-score entities only (~8-10min overhead on a full 12k-entity build).
+        self.config.source_policies.allow_sec_live_fallback = True
         self.config.source_policies.allow_gleif_api_fallback = False
         # Override cache paths if caller specified them
         if mcap_cache_path:
