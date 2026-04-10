@@ -311,11 +311,10 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[lis
 
     awards_by_key: dict[str, dict] = {}
     records_by_key: dict[str, ContractRecord] = {}
-    total_rows = 0
+    rejection_stats: dict = {}
+    _last_logged = 0
 
-    for record in read_sam_gov_csv(sam_csv):
-        total_rows += 1
-
+    for record in read_sam_gov_csv(sam_csv, rejection_stats=rejection_stats):
         if month_filter and record.posted_date:
             try:
                 if int(record.posted_date.split("-")[1]) != month_filter:
@@ -326,20 +325,26 @@ def stage1_load_and_filter(year: int = 2023, month_filter: int = 0) -> tuple[lis
         awards_by_key[record.piid] = _record_to_award_dict(record)
         records_by_key[record.piid] = record
 
-        if total_rows % 50_000 == 0:
-            log.info(f"  ... {total_rows:,} rows read, {len(awards_by_key):,} unique awards so far")
+        total_so_far = rejection_stats.get("rows_total", 0)
+        if total_so_far - _last_logged >= 50_000:
+            _last_logged = total_so_far
+            log.info(f"  ... {total_so_far:,} rows read, {len(awards_by_key):,} unique awards so far")
 
     awards = list(awards_by_key.values())
     after_load = len(awards)
+    total_rows = rejection_stats.get("rows_total", 0)
     log.info(f"  {total_rows:,} rows read → {after_load:,} awards (amount/IDV filtered at read time)")
     log.info(f"  Final: {len(awards):,} contracts")
 
     _write_csv(FILTERED_CSV, awards)
 
     _save_cp(CP_STAGE1, {
-        "total_rows_read": total_rows,
-        "after_load": after_load,
-        "final_count": len(awards),
+        "total_rows_read":      total_rows,
+        "rows_removed_foreign": rejection_stats.get("rows_foreign", 0),
+        "rows_removed_idv":     rejection_stats.get("rows_idv", 0),
+        "rows_removed_amount":  rejection_stats.get("rows_amount", 0),
+        "after_load":           after_load,
+        "final_count":          len(awards),
     })
 
     log.info(f"Stage 1 complete in {_elapsed(t0)}")
