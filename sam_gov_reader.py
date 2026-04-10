@@ -68,17 +68,29 @@ class ContractRecord:
     is_federally_funded_rd: bool
 
 
-def read_sam_gov_csv(path: str) -> Iterator[ContractRecord]:
+def read_sam_gov_csv(path: str, rejection_stats: dict | None = None) -> Iterator[ContractRecord]:
     """Read SAM.gov bulk CSV export, yield validated ContractRecord per row.
 
     Handles the SAM.gov report preamble by scanning for the header row
     (the line containing "CAGE Code").
 
     Silently skips: foreign entities, IDV umbrellas, out-of-range/unparseable amounts.
+    If rejection_stats dict is provided, increments keys:
+      rows_total, rows_foreign, rows_idv, rows_amount
     Raises: FileNotFoundError if path does not exist.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"SAM.gov CSV not found: {path}")
+
+    if rejection_stats is not None:
+        rejection_stats.setdefault("rows_total", 0)
+        rejection_stats.setdefault("rows_foreign", 0)
+        rejection_stats.setdefault("rows_idv", 0)
+        rejection_stats.setdefault("rows_amount", 0)
+
+    def _inc(key: str):
+        if rejection_stats is not None:
+            rejection_stats[key] = rejection_stats.get(key, 0) + 1
 
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
         # Skip preamble: advance until we find the header row (contains "CAGE Code")
@@ -97,21 +109,27 @@ def read_sam_gov_csv(path: str) -> Iterator[ContractRecord]:
         reader = csv.DictReader(io.StringIO(remaining))
 
         for row in reader:
+            _inc("rows_total")
+
             # Hard-reject: foreign / missing country
             country = (row.get("Country of Incorporation") or "").strip().upper()
             if country != "USA":
+                _inc("rows_foreign")
                 continue
 
             # Hard-reject: IDV umbrella contracts
             if (row.get("IDV Type") or "").strip():
+                _inc("rows_idv")
                 continue
 
             # Hard-reject: unparseable or out-of-range amount
             try:
                 amount = float((row.get(_AMOUNT_COL) or "0").replace("$", "").replace(",", ""))
             except (ValueError, TypeError):
+                _inc("rows_amount")
                 continue
             if amount < MIN_CONTRACT_VALUE or amount > MAX_AWARD_AMOUNT:
+                _inc("rows_amount")
                 continue
 
             yield ContractRecord(
