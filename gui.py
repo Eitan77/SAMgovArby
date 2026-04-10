@@ -5,6 +5,7 @@ Requires: pip install PyQt6 matplotlib
 """
 
 import csv
+import json
 import logging
 import os
 import re
@@ -1683,6 +1684,8 @@ class TrainingDataTab(QWidget):
         self._btn_s1.setObjectName("run_btn")
         self._btn_s1.clicked.connect(lambda: self._run_build("build"))
         s1l.addWidget(self._btn_s1)
+        self._s1_stats = self._make_stats_label()
+        s1l.addWidget(self._s1_stats)
         stages_row.addWidget(s1)
 
         # Stage 2
@@ -1698,6 +1701,8 @@ class TrainingDataTab(QWidget):
         self._btn_s2 = QPushButton("⟳  Resume Build")
         self._btn_s2.clicked.connect(lambda: self._run_build("build"))
         s2l.addWidget(self._btn_s2)
+        self._s2_stats = self._make_stats_label()
+        s2l.addWidget(self._s2_stats)
         stages_row.addWidget(s2)
 
         # Stage 3
@@ -1714,6 +1719,8 @@ class TrainingDataTab(QWidget):
         self._btn_s3.setObjectName("run_btn")
         self._btn_s3.clicked.connect(self._run_enrich)
         s3l.addWidget(self._btn_s3)
+        self._s3_stats = self._make_stats_label()
+        s3l.addWidget(self._s3_stats)
         stages_row.addWidget(s3)
 
         root.addLayout(stages_row)
@@ -1754,6 +1761,123 @@ class TrainingDataTab(QWidget):
                 status_lbl.setText("Not found")
                 status_lbl.setStyleSheet("color: #f38ba8;")
             WATCHER.refresh_watch(path)
+        self._refresh_stats()
+
+    @staticmethod
+    def _make_stats_label() -> QLabel:
+        lbl = QLabel("No data yet")
+        lbl.setStyleSheet(
+            "color: #a6adc8; font-size: 11px; font-family: monospace;"
+            "background: #181825; border-radius: 4px; padding: 6px;"
+        )
+        lbl.setWordWrap(False)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        return lbl
+
+    def _refresh_stats(self):
+        from collections import Counter
+        ds    = self._ds()
+        tag   = ds["tag"]
+        cpdir = DATASETS_DIR / f"checkpoints_{tag}"
+
+        # ── Stage 1 ──────────────────────────────────────────────────────────
+        try:
+            with open(cpdir / "stage1_filter.json") as f:
+                s1 = json.load(f)
+            total   = s1.get("total_rows_read", 0)
+            foreign = s1.get("rows_removed_foreign", 0)
+            idv     = s1.get("rows_removed_idv", 0)
+            amount  = s1.get("rows_removed_amount", 0)
+            passed  = s1.get("final_count", 0)
+
+            def pct1(n):
+                return f"{n / total * 100:5.1f}%" if total else "  —  "
+
+            self._s1_stats.setText(
+                f"Total rows read  : {total:>8,}<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"Removed (foreign): {foreign:>8,}  ({pct1(foreign)})<br>"
+                f"Removed (IDV)    : {idv:>8,}  ({pct1(idv)})<br>"
+                f"Removed (amount) : {amount:>8,}  ({pct1(amount)})<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"<span style='color:#a6e3a1'>→ Into Stage 2   : {passed:>8,}  ({pct1(passed)})</span>"
+            )
+        except Exception:
+            self._s1_stats.setText("<span style='color:#585b70'>No data yet</span>")
+
+        # ── Stage 2 ──────────────────────────────────────────────────────────
+        try:
+            with open(cpdir / "stage2_tickers.json") as f:
+                s2 = json.load(f)
+            total2   = len(s2)
+            resolved = sum(1 for v in s2.values() if v.get("ticker"))
+            unres    = total2 - resolved
+
+            def pct2(n):
+                return f"{n / total2 * 100:5.1f}%" if total2 else "  —  "
+
+            def rpct(n):
+                return f"{n / resolved * 100:5.1f}%" if resolved else "  —  "
+
+            confs = Counter(v.get("ticker_confidence", "") for v in s2.values())
+            evids = Counter(v.get("evidence_type", "")     for v in s2.values())
+
+            self._s2_stats.setText(
+                f"Total awards     : {total2:>8,}<br>"
+                f"Resolved         : {resolved:>8,}  ({pct2(resolved)})<br>"
+                f"Unresolved       : {unres:>8,}  ({pct2(unres)})<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"By confidence (resolved):<br>"
+                f"&nbsp;&nbsp;High       : {confs.get('high', 0):>6,}  ({rpct(confs.get('high', 0))})<br>"
+                f"&nbsp;&nbsp;Medium     : {confs.get('medium', 0):>6,}  ({rpct(confs.get('medium', 0))})<br>"
+                f"&nbsp;&nbsp;Low-medium : {confs.get('low_medium', 0):>6,}  ({rpct(confs.get('low_medium', 0))})<br>"
+                f"&nbsp;&nbsp;Low        : {confs.get('low', 0):>6,}<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"By evidence type:<br>"
+                f"&nbsp;&nbsp;SEC exact  : {evids.get('sec_exact', 0):>6,}<br>"
+                f"&nbsp;&nbsp;Known alias: {evids.get('known_alias', 0):>6,}<br>"
+                f"&nbsp;&nbsp;Non-public : {evids.get('null:non_public_entity', 0):>6,}<br>"
+                f"&nbsp;&nbsp;Low score  : {evids.get('null:low_score', 0):>6,}<br>"
+                f"&nbsp;&nbsp;No match   : {evids.get('none', 0):>6,}<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"<span style='color:#a6e3a1'>→ Into Stage 3   : {resolved:>8,}</span>"
+            )
+        except Exception:
+            self._s2_stats.setText("<span style='color:#585b70'>No data yet</span>")
+
+        # ── Stage 3 ──────────────────────────────────────────────────────────
+        try:
+            with open(cpdir / "stage3_enrich.json") as f:
+                s3 = json.load(f)
+            enriched = len(s3)
+            try:
+                with open(cpdir / "stage2_tickers.json") as f2:
+                    s2_data = json.load(f2)
+                qualifying = sum(1 for v in s2_data.values() if v.get("ticker"))
+            except Exception:
+                qualifying = enriched
+
+            def pct3(n):
+                return f"{n / qualifying * 100:5.1f}%" if qualifying else "  —  "
+
+            with_ohlc     = sum(1 for v in s3.values() if v.get("price_t0") not in ("", None))
+            with_8k       = sum(1 for v in s3.values() if v.get("first_8k_date") not in ("", None))
+            with_dilutive = sum(1 for v in s3.values() if v.get("last_dilutive_filing_date") not in ("", None))
+            with_mcap     = sum(1 for v in s3.values() if v.get("historical_market_cap_approx") not in ("", None))
+
+            self._s3_stats.setText(
+                f"Qualifying (ticker)  : {qualifying:>6,}<br>"
+                f"Enriched             : {enriched:>6,}  ({pct3(enriched)})<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"With OHLC prices     : {with_ohlc:>6,}  ({pct3(with_ohlc)})<br>"
+                f"With 8-K filing      : {with_8k:>6,}  ({pct3(with_8k)})<br>"
+                f"With dilutive filing : {with_dilutive:>6,}  ({pct3(with_dilutive)})<br>"
+                f"With hist market cap : {with_mcap:>6,}  ({pct3(with_mcap)})<br>"
+                f"<span style='color:#45475a'>──────────────────────────────</span><br>"
+                f"<span style='color:#a6e3a1'>→ Final dataset  : {enriched:>7,}</span>"
+            )
+        except Exception:
+            self._s3_stats.setText("<span style='color:#585b70'>No data yet</span>")
 
     def _run_build(self, name: str):
         self._set_building(True)
