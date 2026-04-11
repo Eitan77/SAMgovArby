@@ -434,128 +434,69 @@ def stage2_resolve_tickers(
     awards: list[dict],
     records_by_key: dict[str, ContractRecord] | None = None,
 ) -> list[dict]:
-    """Resolve each award's company to a ticker using TickerResolverV4.
+    """Resolve each award's company to a ticker using the V1 pipeline.
 
-    Deduplicates by V4 cache key (CAGE code → UEI → legal name → contractor name),
-    resolves once per unique entity, then maps to all matching awards.
+    Builds entity clusters, runs 8-stage resolution in bulk (~1ms/cluster),
+    then maps results back to individual awards.
     """
-    from resolver import TickerResolverV4
+    import pandas as pd
+    from resolver.api import resolve_v1
 
     log.info("=" * 60)
-    log.info("STAGE 2: TICKER RESOLUTION (V4)")
+    log.info("STAGE 2: TICKER RESOLUTION (V1)")
     log.info(f"  Input  : {len(awards):,} filtered awards")
-    log.info(f"  Cache  : {os.path.basename(TICKER_CACHE_V4_FILE)}")
     log.info(f"  Output : {os.path.basename(STAGE2_CSV)}")
     log.info("=" * 60)
-    print("[STAGE2_START] Beginning ticker resolution...", flush=True)
+    print("[STAGE2_START] Beginning ticker resolution (V1)...", flush=True)
     t0 = time.time()
 
-    cp = _load_cp(CP_STAGE2)
-    already_done = len(cp)
-    if already_done:
-        log.info(f"  Resuming: {already_done:,} awards already in checkpoint")
-        print(f"[STAGE2_RESUME] {already_done:,} awards already resolved in checkpoint", flush=True)
+    print(f"[STAGE2_RESOLVING] Resolving {len(awards):,} awards via V1 pipeline...", flush=True)
 
-    print("[STAGE2_INIT] Loading EDGAR company map...", flush=True)
-    edgar_map = _load_edgar_map()
-    print(f"[STAGE2_INIT] EDGAR map loaded: {len(edgar_map):,} companies. Building resolver...", flush=True)
-    resolver  = TickerResolverV4(edgar_map, cache_path=TICKER_CACHE_V4_FILE)
-    print("[STAGE2_INIT] Resolver ready.", flush=True)
+    result_df = resolve_v1(
+        pd.DataFrame(awards),
+        db_path=os.path.join(ROOT, "data", "cache", "resolver.duckdb"),
+        cache_dir=os.path.join(ROOT, "data", "cache"),
+    )
 
-    # Deduplicate by V4 cache key: resolve once per unique entity
-    def _v4_key(award: dict) -> str:
-        return (
-            award.get("cage_code")
-            or award.get("uei")
-            or award.get("legal_business_name")
-            or award.get("awardee_name")
-            or ""
-        )
+    # V1 confidence_band → Stage 2 ticker_confidence
+    _BAND = {"very_high": "high", "high": "high", "medium": "medium", "low": "low"}
 
-    entity_key_to_award_keys: dict[str, list[str]] = {}
-    skipped_count = 0
-    for award in awards:
-        award_key = award["award_key"]
-        if award_key in cp:
-            skipped_count += 1
-        else:
-            ek = _v4_key(award)
-            entity_key_to_award_keys.setdefault(ek, []).append(award_key)
-
-    # Pick one representative award_key per entity (to get its ContractRecord)
-    unique_entity_keys = list(entity_key_to_award_keys.keys())
-    # Build entity_key → ContractRecord mapping using first award in each group
-    ek_to_record: dict[str, ContractRecord] = {}
-    if records_by_key:
-        for ek, award_keys in entity_key_to_award_keys.items():
-            for ak in award_keys:
-                if ak in records_by_key:
-                    ek_to_record[ek] = records_by_key[ak]
-                    break
-
-    log.info(f"  {len(awards):,} awards → {len(unique_entity_keys):,} unique entities to resolve "
-             f"({skipped_count:,} from checkpoint)")
-
+    cp: dict[str, dict] = {}
+    enriched: list[dict] = []
     resolved_count = unresolved_count = 0
-    CHECKPOINT_BATCH = 50
-    total_unique = len(unique_entity_keys)
 
-    print(f"[STAGE2_RESOLVING] Resolving {total_unique:,} unique entities ({skipped_count:,} from checkpoint)...", flush=True)
+    # Build award_key → V1 result lookup (vectorized where possible)
+    v1_by_key: dict[str, dict] = {}
+    for _, r in result_df.iterrows():
+        ticker = (r.get("preferred_ticker") or "").strip()
+        band   = r.get("confidence_band") or ""
+        pub_id = r.get("public_company_id") or ""
+        cik    = pub_id.replace("CIK_", "") if pub_id.startswith("CIK_") else ""
+        v1_by_key[r.get("award_key") or r.get("piid") or ""] = {
+            "ticker":            ticker,
+            "cik":               cik,
+            "ticker_confidence": _BAND.get(band, "none") if ticker else "none",
+            "evidence_type":     r.get("resolution_stage") or "",
+        }
 
-    for i, ek in enumerate(unique_entity_keys):
-        if i == 0:
-            print("[STAGE2_RESOLVING] Processing first entity...", flush=True)
-
-        record = ek_to_record.get(ek)
-        if record is None:
-            unresolved_count += 1
-            entry = {"ticker": "", "cik": "", "ticker_confidence": "none"}
-        else:
-            result = resolver.resolve(record)
-            ticker = result.get("resolved_ticker") or ""
-            entry  = {
-                "ticker":            ticker,
-                "cik":               result.get("resolved_cik") or "",
-                "ticker_confidence": result.get("confidence", "none"),
-                "evidence_type":     result.get("evidence_type", ""),
-            }
-            if ticker:
-                resolved_count += 1
-            else:
-                unresolved_count += 1
-
-        for ak in entity_key_to_award_keys[ek]:
-            cp[ak] = entry
-
-        if i == 0:
-            print(f"[STAGE2_RESOLVING] First entity done: ticker={entry.get('ticker') or 'none'} "
-                  f"confidence={entry.get('ticker_confidence')} evidence={entry.get('evidence_type')}", flush=True)
-
-        if (i + 1) % CHECKPOINT_BATCH == 0:
-            _save_cp(CP_STAGE2, cp)
-            pct = (i + 1) / total_unique * 100
-            pct_resolved = resolved_count / (i + 1) * 100
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta_s = (total_unique - i - 1) / rate if rate > 0 else 0
-            eta_min = eta_s / 60
-            log.info(f"  [{i+1:,}/{total_unique:,} — {pct:.1f}%] "
-                     f"resolved={resolved_count:,} ({pct_resolved:.1f}%)  unresolved={unresolved_count:,}")
-            print(f"[STAGE2_PROGRESS] {i+1:,}/{total_unique:,} ({pct:.0f}%) | "
-                  f"Resolved: {resolved_count:,} ({pct_resolved:.0f}%) | "
-                  f"Rate: {rate:.1f}/s | ETA: {eta_min:.0f}min", flush=True)
-
-    resolver.save_cache()
-    _save_cp(CP_STAGE2, cp)
-    pct_resolved = resolved_count / len(unique_entity_keys) * 100 if unique_entity_keys else 0
-    log.info(f"  Resolution complete: {resolved_count:,} resolved ({pct_resolved:.1f}%), "
-             f"{unresolved_count:,} unresolved, {skipped_count:,} from checkpoint")
-    print(f"[STAGE2_COMPLETE] {resolved_count:,} resolved | {unresolved_count:,} unresolved | {pct_resolved:.1f}%", flush=True)
-
-    enriched = []
     for award in awards:
-        entry = cp.get(award["award_key"], {})
+        ak    = award["award_key"]
+        entry = v1_by_key.get(ak, {"ticker": "", "cik": "", "ticker_confidence": "none", "evidence_type": ""})
+        cp[ak] = entry
         enriched.append({**award, **entry})
+        if entry["ticker"]:
+            resolved_count += 1
+        else:
+            unresolved_count += 1
+
+    _save_cp(CP_STAGE2, cp)
+
+    elapsed      = time.time() - t0
+    pct_resolved = resolved_count / len(awards) * 100 if awards else 0
+    log.info(f"  V1 resolution complete: {resolved_count:,} resolved ({pct_resolved:.1f}%), "
+             f"{unresolved_count:,} unresolved")
+    print(f"[STAGE2_COMPLETE] {resolved_count:,} resolved | {unresolved_count:,} unresolved | "
+          f"{pct_resolved:.1f}% | {elapsed:.1f}s", flush=True)
 
     _write_csv(STAGE2_CSV, enriched)
     log.info(f"Stage 2 complete in {_elapsed(t0)}")
