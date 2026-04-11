@@ -297,3 +297,48 @@ def historical_symbol_coverage_bucket(value: date | None) -> str | None:
     if value >= cutoff_mid:
         return "2019_06_15_to_2021_06_14"
     return "pre_2019_06_15"
+
+
+# ── V1 normalization additions ─────────────────────────────────────────────────
+
+_CONS_PUNCT_RE = re.compile(r"[.,'\"/\\]")
+
+def conservative_normalize(value: str | None) -> str | None:
+    """V1 conservative: uppercase, trim, collapse spaces, strip .,'\"/\\, & → AND, unicode → ASCII."""
+    if not value or not value.strip():
+        return None
+    s = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    s = s.strip().upper()
+    s = s.replace("&", " AND ")
+    s = _CONS_PUNCT_RE.sub("", s)   # strip periods/commas/quotes directly (no space)
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    return re.sub(r" +", " ", s).strip() or None
+
+
+_AGG_REMOVE = {
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY",
+    "LLC", "LTD", "LIMITED", "PLC", "THE", "HOLDINGS", "HOLDING",
+    "GROUP", "LP", "LLP", "ENTERPRISES",
+}
+
+
+def aggressive_normalize(value: str | None) -> str | None:
+    """Conservative normalization + remove corporate suffixes + token-sorted.
+    Guardrail: never returns empty string."""
+    cons = conservative_normalize(value)
+    if not cons:
+        return None
+    tokens = [t for t in cons.split() if t not in _AGG_REMOVE]
+    if not tokens:
+        return cons  # fallback: e.g. "Holdings LLC" → "HOLDINGS LLC"
+    return " ".join(sorted(tokens))
+
+
+def token_metadata(value: str | None) -> dict:
+    """Return token list, count, and bigrams for matching."""
+    cons = conservative_normalize(value)
+    if not cons:
+        return {"tokens": [], "token_count": 0, "bigrams": []}
+    tokens = [t for t in cons.split() if t not in COMMON_STOPWORDS]
+    bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)]
+    return {"tokens": tokens, "token_count": len(tokens), "bigrams": bigrams}

@@ -217,3 +217,89 @@ def _format_output(df, return_format: str):
     if return_format == "dict":
         return df.to_dict(orient="records")
     return df
+
+
+# ── resolve_v1 ────────────────────────────────────────────────────────────────
+
+def resolve_v1(
+    contracts,
+    db_path:   str  = "data/cache/resolver.duckdb",
+    cache_dir: str  = "data/cache",
+    config:    dict | None = None,
+    refresh:   bool = False,
+) -> "pd.DataFrame":
+    """
+    V1 pipeline entry point.
+    contracts: DataFrame | path-to-CSV | path-to-Parquet
+    Returns DataFrame with V1 output columns.
+    """
+    import json
+    import pandas as pd
+    from resolver.storage import get_db, ensure_schema
+    from resolver.issuer_master import refresh_issuer_master, get_issuer_master_version
+    from resolver.clusters import build_entity_clusters
+    from resolver.pipeline import (ClusterContext, resolve_cluster,
+                                   flush_resolution_cache_pending,
+                                   invalidate_resolution_cache,
+                                   invalidate_alias_index)
+    from resolver.models import V1ThresholdsConfig
+    from resolver.normalize import conservative_normalize
+    from resolver.ingest import load_contracts, assign_contract_row_ids, build_contract_identity_features
+
+    con = get_db(db_path)
+    ensure_schema(con)
+    if refresh:
+        im_version = refresh_issuer_master(con, cache_dir, force=True)
+        invalidate_alias_index()       # issuer_master/aliases rebuilt — drop stale index
+        invalidate_resolution_cache()  # old cache entries may reference stale issuers
+    else:
+        im_version = get_issuer_master_version(con)
+
+    thresholds = V1ThresholdsConfig()
+    if config:
+        for k, v in config.get("thresholds", {}).items():
+            if hasattr(thresholds, k):
+                setattr(thresholds, k, v)
+
+    df             = load_contracts(contracts)
+    df             = assign_contract_row_ids(df)
+    features       = build_contract_identity_features(df)
+    row_to_cluster = build_entity_clusters(features, con)
+
+    current_cluster_ids = set(row_to_cluster.values())
+    placeholders = ", ".join("?" * len(current_cluster_ids))
+    clusters = con.execute(
+        "SELECT entity_cluster_id, canonical_parent_name, canonical_entity_name, "
+        "ultimate_parent_uei, uei, cage_code, all_parent_names_json, "
+        f"all_legal_names_json, all_dba_names_json FROM entity_clusters "
+        f"WHERE entity_cluster_id IN ({placeholders})",
+        list(current_cluster_ids),
+    ).fetchall()
+
+    cluster_results: dict[str, dict] = {}
+    for row in clusters:
+        cid, cp, ce, puei, uei, cage, pj, lj, dj = row
+        ctx = ClusterContext(
+            cluster_id=cid, canonical_parent_name=cp, canonical_entity_name=ce,
+            uei=uei, parent_uei=puei, cage=cage,
+            parent_name_norm=conservative_normalize(cp),
+            legal_name_norm=conservative_normalize(ce),
+            all_parent_names=json.loads(pj or "[]"),
+            all_legal_names=json.loads(lj or "[]"),
+            all_dba_names=json.loads(dj or "[]"),
+        )
+        cluster_results[cid] = resolve_cluster(ctx, con, thresholds, im_version)
+
+    # Flush all queued resolution cache writes in one bulk operation
+    flush_resolution_cache_pending(con)
+
+    # Join resolution results back to contract rows (vectorized — no iterrows)
+    df["_cluster_id"] = df["contract_row_id"].map(row_to_cluster)
+    res_df = pd.DataFrame(list(cluster_results.values()))
+    if not res_df.empty:
+        res_df = res_df.rename(columns={"entity_cluster_id": "_cluster_id"})
+        result = df.merge(res_df, on="_cluster_id", how="left")
+    else:
+        result = df.copy()
+    result = result.drop(columns=["_cluster_id"], errors="ignore")
+    return result

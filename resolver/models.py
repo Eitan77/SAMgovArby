@@ -555,3 +555,97 @@ class ReferenceHandles:
     substr_index:        list = field(default_factory=list)   # [(stripped, name, entry), ...] for substring match
     loaded_at:           datetime = field(default_factory=datetime.utcnow)
     reference_version:   str = "unknown"
+
+
+# ── V1 output schema ──────────────────────────────────────────────────────────
+
+RESOLVER_V1_VERSION = "1.0"
+
+
+def score_to_confidence_band(score: float) -> str:
+    """V1 spec bands: 95-100=very_high, 85-94=high, 70-84=medium, <70=low."""
+    if score >= 95:
+        return "very_high"
+    if score >= 85:
+        return "high"
+    if score >= 70:
+        return "medium"
+    return "low"
+
+
+@dataclass
+class V1FinalRow:
+    contract_row_id:                str
+    entity_cluster_id:              str | None
+    resolved:                       bool
+    public_company_id:              str | None
+    public_company_id_type:         str | None
+    public_company_name:            str | None
+    preferred_ticker:               str | None
+    preferred_exchange:             str | None
+    relationship_type:              str | None
+    resolution_stage:               str | None
+    confidence_score:               float
+    confidence_band:                str
+    match_explanation:              str | None
+    matched_entity_name:            str | None
+    matched_parent_name:            str | None
+    matched_alias:                  str | None
+    manual_override_used:           bool
+    ambiguous:                      bool
+    needs_review:                   bool
+    share_class_rule_used:          str | None
+    historical_ticker_attempted:    bool = False
+    ticker_as_of_award_date:        str | None = None
+    ticker_as_of_award_confidence:  str | None = None
+    run_id:                         str | None = None
+
+
+@dataclass
+class V1EntityCache:
+    entity_cluster_id:      str
+    ultimate_parent_uei:    str | None
+    uei:                    str | None
+    cage:                   str | None
+    canonical_entity_name:  str | None
+    canonical_parent_name:  str | None
+    public_company_id:      str | None
+    public_company_name:    str | None
+    preferred_ticker:       str | None
+    preferred_exchange:     str | None
+    relationship_type:      str | None
+    resolution_stage:       str | None
+    confidence_score:       float
+    first_resolved_at:      str
+    last_validated_at:      str
+    resolver_version:       str = RESOLVER_V1_VERSION
+    issuer_master_version:  str = "unknown"
+    source_evidence_json:   str | None = None
+
+
+@dataclass
+class V1RunMetrics:
+    run_id:                str
+    total_rows:            int = 0
+    total_clusters:        int = 0
+    new_resolved:          int = 0
+    stage_wins:            dict = field(default_factory=dict)
+    unresolved_count:      int = 0
+    ambiguous_count:       int = 0
+    override_hits:         int = 0
+    cache_hits:            int = 0
+    avg_candidates_scored: float = 0.0
+    resolver_version:      str = RESOLVER_V1_VERSION
+
+
+@dataclass
+class V1ThresholdsConfig:
+    """All tunables live here — never inline in pipeline code."""
+    auto_accept_min_score:   float = 80.0
+    auto_accept_margin:      float = 15.0
+    fuzzy_min_score:         float = 70.0
+    unresolved_cutoff:       float = 60.0
+    review_cutoff:           float = 70.0
+    min_tokens_for_fuzzy:    int   = 2
+    max_candidates:          int   = 20
+    enable_openfigi_tail:    bool  = False

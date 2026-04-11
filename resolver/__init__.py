@@ -11,6 +11,7 @@ from resolver.api import (
     resolve_entities,
     refresh_reference_data,
     explain_resolution,
+    resolve_v1,
 )
 from resolver.models import (
     ResolverConfig,
@@ -42,6 +43,8 @@ __all__ = [
     "FinalResolution",
     "OverrideRecord",
     "ResolverStatus",
+    # V1 pipeline
+    "resolve_v1",
     # Backward compat
     "TickerResolverV4",
     "resolve_ticker",

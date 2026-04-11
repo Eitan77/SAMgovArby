@@ -92,6 +92,18 @@ _FIELD_ALIASES: dict[str, str] = {
     "extent_competed_code":             "extent_competed_code",
     "other_than_full_open":             "other_than_full_open",
     "num_offers":                       "num_offers",
+    # Short-form aliases used by test_week.csv and USASpending condensed exports
+    "uei":                              "unique_entity_id",
+    "award_id":                         "piid",
+    "posted_date":                      "date_signed",
+    "awardee_name":                     "contractor_name",
+    "parent_recipient_name":            "ultimate_parent_legal_business_name",
+    "dba_name":                         "doing_business_as_name",
+    "agency":                           "naics_description",
+    "naics":                            "naics_code",
+    "set_aside":                        "extent_competed_code",
+    "extent_competed":                  "other_than_full_open",
+    "award_amount":                     "dollars_obligated",
 }
 
 # ── Contract ingestion ────────────────────────────────────────────────────────
