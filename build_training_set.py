@@ -461,22 +461,28 @@ def stage2_resolve_tickers(
     # V1 confidence_band → Stage 2 ticker_confidence
     _BAND = {"very_high": "high", "high": "high", "medium": "medium", "low": "low"}
 
+    # Pandas uses NaN (float) for missing — normalise to empty string before iterating
+    for col in ("preferred_ticker", "confidence_band", "public_company_id",
+                "resolution_stage", "award_key", "piid"):
+        if col in result_df.columns:
+            result_df[col] = result_df[col].fillna("")
+
     cp: dict[str, dict] = {}
     enriched: list[dict] = []
     resolved_count = unresolved_count = 0
 
-    # Build award_key → V1 result lookup (vectorized where possible)
+    # Build award_key → V1 result lookup
     v1_by_key: dict[str, dict] = {}
     for _, r in result_df.iterrows():
-        ticker = (r.get("preferred_ticker") or "").strip()
-        band   = r.get("confidence_band") or ""
-        pub_id = r.get("public_company_id") or ""
+        ticker = r.get("preferred_ticker", "").strip()
+        band   = r.get("confidence_band", "")
+        pub_id = r.get("public_company_id", "")
         cik    = pub_id.replace("CIK_", "") if pub_id.startswith("CIK_") else ""
         v1_by_key[r.get("award_key") or r.get("piid") or ""] = {
             "ticker":            ticker,
             "cik":               cik,
             "ticker_confidence": _BAND.get(band, "none") if ticker else "none",
-            "evidence_type":     r.get("resolution_stage") or "",
+            "evidence_type":     r.get("resolution_stage", ""),
         }
 
     for award in awards:
