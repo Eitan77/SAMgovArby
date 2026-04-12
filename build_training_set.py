@@ -50,6 +50,7 @@ from config import (
     is_sole_source,
 )
 from rate_limiter import RateLimiter
+from news_checker import find_pr_date, has_press_release as _news_has_pr
 from sam_gov_reader import read_sam_gov_csv, find_sam_gov_csv, ContractRecord
 
 # ─── Logging (initialized in main, default for module-level usage) ─────────────
@@ -901,6 +902,13 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
         dilutive_date, dilutive_type = _find_last_dilutive_before_date(subs, date_str)
         log.debug(f"    first_8k={first_8k_date or 'none'}  dilutive={dilutive_date or 'none'}")
 
+        # ── Press release check ───────────────────────────────────────────
+        company_name = award.get("awardee_name", "")
+        normalized_date = _normalize_date(date_str) if date_str else ""
+        first_pr_date = find_pr_date(company_name, normalized_date) if company_name and normalized_date else ""
+        has_pr = _news_has_pr(company_name) if company_name and not first_pr_date else bool(first_pr_date)
+        log.debug(f"    pr={first_pr_date or 'none'}  has_pr={has_pr}")
+
         # ── Agency history ────────────────────────────────────────────────
         prior_wins = agency_history.get(key, 0)
 
@@ -923,9 +931,9 @@ def stage3_enrich(awards: list[dict], agency_history: dict) -> list[dict]:
             "days_to_8k":                 days_to_8k,
             "last_dilutive_filing_date":   dilutive_date,
             "dilutive_filing_type":        dilutive_type,
-            # PR (not yet implemented — mark as unknown so scoring doesn't give free points)
-            "first_pr_date":  "",
-            "has_pr":         "unknown",
+            # PR
+            "first_pr_date":  first_pr_date,
+            "has_pr":         has_pr,
             # Agency history
             "agency_prior_win_count": prior_wins,
         }

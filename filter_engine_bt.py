@@ -109,19 +109,24 @@ def apply_filters_bt_from_training(row):
     days_to_pr = _days_signed(award_date, first_pr)  # positive = PR after award
     extra["first_pr_date"] = first_pr
 
-    # Normalise has_pr_value: CSV may contain None, "", "None", or "unknown"
+    # Resolve press-release status — explicit has_pr field takes priority over date heuristic.
+    # Bug fix: when has_pr="False" and first_pr_date="" the old code fell through to
+    # "days_to_pr is None → None" giving only 7/15 pts instead of the correct 15.
     has_pr_str = str(has_pr_value).strip() if has_pr_value is not None else ""
     if has_pr_str in ("unknown", "None", "nan", ""):
-        # Data was never collected — let scoring handle conservatively (0 pts)
+        # Data was never collected — let scoring use partial credit (7 pts)
         extra["has_press_release"] = None
-    elif days_to_pr is not None and 0 <= days_to_pr <= MAX_PR_WINDOW_DAYS:
-        # PR confirmed within the window → information already public
-        extra["has_press_release"] = True
-    elif days_to_pr is None:
-        # PR date is missing even though has_pr says something — treat as unknown
-        extra["has_press_release"] = None
-    else:
+    elif has_pr_str == "False":
+        # Explicitly confirmed no PR — full "no press release" credit (15 pts)
         extra["has_press_release"] = False
+    elif days_to_pr is not None and 0 <= days_to_pr <= MAX_PR_WINDOW_DAYS:
+        # PR date falls within the window → information already public (0 pts)
+        extra["has_press_release"] = True
+    elif has_pr_str == "True":
+        # PR exists but outside the immediate window — treat as already public (0 pts)
+        extra["has_press_release"] = True
+    else:
+        extra["has_press_release"] = None
 
     # Pass agency win count through for scoring (safe int conversion)
     raw_wins = row.get("agency_prior_win_count", 0)

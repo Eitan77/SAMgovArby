@@ -57,18 +57,28 @@ OUTPUT_FILES = {
 
 DATASET_CONFIGS = {
     "2022 H1  (Jan – Jun)": {
-        "tag":    "H1",
-        "input":  DATASETS_DIR / "All2022_H1.csv",
-        "stage1": DATASETS_DIR / "filtered_training_set_H1.csv",
-        "stage2": DATASETS_DIR / "stage2_with_tickers_H1.csv",
-        "stage3": DATASETS_DIR / "training_set_final_H1.csv",
+        "tag":       "H1",
+        "buildable": True,
+        "input":     DATASETS_DIR / "All2022_H1.csv",
+        "stage1":    DATASETS_DIR / "filtered_training_set_H1.csv",
+        "stage2":    DATASETS_DIR / "stage2_with_tickers_H1.csv",
+        "stage3":    DATASETS_DIR / "training_set_final_H1.csv",
     },
     "2022 H2  (Jul – Dec)": {
-        "tag":    "H2",
-        "input":  DATASETS_DIR / "All2022_H2.csv",
-        "stage1": DATASETS_DIR / "filtered_training_set_H2.csv",
-        "stage2": DATASETS_DIR / "stage2_with_tickers_H2.csv",
-        "stage3": DATASETS_DIR / "training_set_final_H2.csv",
+        "tag":       "H2",
+        "buildable": True,
+        "input":     DATASETS_DIR / "All2022_H2.csv",
+        "stage1":    DATASETS_DIR / "filtered_training_set_H2.csv",
+        "stage2":    DATASETS_DIR / "stage2_with_tickers_H2.csv",
+        "stage3":    DATASETS_DIR / "training_set_final_H2.csv",
+    },
+    "2022 Combined  (Full Year)": {
+        "tag":       "combined",
+        "buildable": False,   # pre-merged from H1 + H2, not built by pipeline
+        "input":     DATASETS_DIR / "training_set_combined.csv",
+        "stage1":    DATASETS_DIR / "filtered_training_set_combined.csv",  # does not exist
+        "stage2":    DATASETS_DIR / "stage2_with_tickers_combined.csv",    # does not exist
+        "stage3":    DATASETS_DIR / "training_set_combined.csv",
     },
 }
 DATASET_LABELS = list(DATASET_CONFIGS.keys())
@@ -1131,7 +1141,7 @@ class BacktestTab(QWidget):
         headers, rows = _load_csv(OUTPUT_FILES["optimizer"])
         if not rows:
             return
-        # Sort by SQN descending to get best row
+        # Sort by avg_pnl_per_week descending to get best row
         try:
             rows.sort(key=lambda r: _rank_score_gui(r), reverse=True)
         except Exception:
@@ -1425,10 +1435,24 @@ class BacktestTab(QWidget):
 # ─── OptimizerTab ─────────────────────────────────────────────────────────────
 
 def _rank_score_gui(row: dict) -> float:
-    """Compute SQN for display. Mirrors optimizer._rank_score."""
+    """Rank by avg_pnl_per_week — mirrors optimizer._rank_score.
+    Maximizes expected weekly profit (frequency × per-trade quality).
+    Requires >= 5 trades.
+    """
+    n = int(float(row.get("trades", 0) or 0))
+    if n < 5:
+        return -999.0
+    tpw = float(row.get("trades_per_week", 0) or 0)
+    if tpw <= 0:
+        return -999.0
+    return float(row.get("avg_pnl_per_week", -999.0) or -999.0)
+
+
+def _sqn_gui(row: dict) -> float:
+    """SQN (Van Tharp) — informational display only, not used for ranking."""
     import math
     n = int(float(row.get("trades", 0) or 0))
-    if n < 15:
+    if n < 5:
         return -999.0
     exp = float(row.get("expectancy", 0) or 0)
     std = float(row.get("std_dev_pnl", 0) or 0)
@@ -1609,13 +1633,13 @@ class OptimizerTab(QWidget):
         avg_pnl  = _flt("avg_pnl_pct")
         avg_win  = _flt("avg_win")
         avg_loss = _flt("avg_loss")
-        sqn      = _rank_score_gui(best)
+        sqn      = _sqn_gui(best)
         for label, value, color in [
             ("Win Rate",      f"{wr:.1f}%",            "#a6e3a1" if wr >= 50 else "#f38ba8"),
             ("Avg PnL/Trade", f"{avg_pnl:+.3f}%",      "#a6e3a1" if avg_pnl >= 0 else "#f38ba8"),
             ("Avg Win",       f"+{avg_win:.3f}%",       "#a6e3a1"),
             ("Avg Loss",      f"-{avg_loss:.3f}%",      "#f38ba8"),
-            ("SQN Score",     f"{sqn:.2f}" if sqn > -999 else "n/a", "#f9e2af"),
+            ("SQN",           f"{sqn:.2f}" if sqn > -999 else "n/a", "#f9e2af"),
         ]:
             row3.addWidget(_make_stat_card(label, value, color))
         self._best_lay.addLayout(row3)
@@ -1924,10 +1948,47 @@ class TrainingDataTab(QWidget):
             self._s3_stats.setText("<span style='color:#585b70; font-size:13px;'>No data yet</span>")
 
     def _run_build(self, name: str):
+        ds = self._ds()
+        if not ds.get("buildable", True):
+            # Combined = merge H1 + H2 stage3 files
+            self._merge_combined()
+            return
         self._set_building(True)
         args = [str(SCRIPTS_DIR / "build_training_set.py"), "--quiet",
-                "--dataset", self._ds()["tag"]]
+                "--dataset", ds["tag"]]
         PROC.start(name, args, log_widget=self._log, on_finished=self._on_finished)
+
+    def _merge_combined(self):
+        """Merge H1 + H2 training_set_final CSVs into training_set_combined.csv."""
+        from PyQt6.QtWidgets import QMessageBox
+        h1 = DATASET_CONFIGS["2022 H1  (Jan – Jun)"]["stage3"]
+        h2 = DATASET_CONFIGS["2022 H2  (Jul – Dec)"]["stage3"]
+        out = DATASET_CONFIGS["2022 Combined  (Full Year)"]["stage3"]
+        missing = [p.name for p in (h1, h2) if not p.exists()]
+        if missing:
+            QMessageBox.warning(self, "Missing files",
+                f"Cannot merge — these files are missing:\n  {chr(10).join(missing)}\n\n"
+                "Build H1 and H2 first.")
+            return
+        try:
+            import csv as _csv
+            rows_written = 0
+            with open(out, "w", newline="", encoding="utf-8") as fout:
+                writer = None
+                for src in (h1, h2):
+                    with open(src, newline="", encoding="utf-8") as fin:
+                        reader = _csv.DictReader(fin)
+                        if writer is None:
+                            writer = _csv.DictWriter(fout, fieldnames=reader.fieldnames,
+                                                     extrasaction="ignore")
+                            writer.writeheader()
+                        for row in reader:
+                            writer.writerow(row)
+                            rows_written += 1
+            self._log.append(f"[merge] Wrote {rows_written:,} rows → {out.name}")
+            self._refresh_status()
+        except Exception as e:
+            QMessageBox.critical(self, "Merge failed", str(e))
 
     def _run_enrich(self):
         stage3 = self._ds()["stage3"]

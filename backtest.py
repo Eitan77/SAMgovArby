@@ -203,25 +203,44 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     total_to_process = min(len(rows), max_records)
     signals = 0
     filtered = 0
-    seen_trades = set()  # (ticker, date) dedup
+    seen_trades = set()          # (ticker, date) same-day dedup
+    ticker_last_entry: dict = {} # ticker → last entry date string (for overlap guard)
     t_start = time.time()
 
     log.info(f"Processing {total_to_process} awards from training data...")
     for i, row in enumerate(rows[:max_records]):
         result = _process_training_row(row, tp, sl, hold, threshold)
 
-        # Deduplicate: only one trade per ticker per day
+        # Deduplicate: (1) no two trades for same ticker on same day,
+        # (2) no new trade if a prior position in that ticker is still within hold window.
         if result.get("filter_result") == "pass" and result.get("ticker"):
-            key = (result["ticker"], result.get("award_date", "")[:10])
+            ticker = result["ticker"]
+            award_date = result.get("award_date", "")[:10]
+            key = (ticker, award_date)
+            overlap = False
             if key in seen_trades:
+                overlap = True
+                reason = f"Duplicate trade for {ticker} on {award_date}"
+            elif ticker in ticker_last_entry:
+                prev = ticker_last_entry[ticker]
+                try:
+                    from datetime import date as _date
+                    delta = (_date.fromisoformat(award_date) - _date.fromisoformat(prev)).days
+                    if 0 < delta <= hold:
+                        overlap = True
+                        reason = f"Position overlap: {ticker} entered {prev}, hold={hold}d"
+                except (ValueError, TypeError):
+                    pass
+
+            if overlap:
                 result["filter_result"] = "duplicate"
-                result["filter_reason"] = f"Duplicate trade for {key[0]} on {key[1]}"
-                # Clear trade fields so it doesn't count as traded
+                result["filter_reason"] = reason
                 for fld in ("entry_price", "exit_price", "pnl_pct", "entry_date",
                             "exit_date", "exit_reason", "hit_tp", "hit_sl", "timed_out"):
                     result.pop(fld, None)
             else:
                 seen_trades.add(key)
+                ticker_last_entry[ticker] = award_date
 
         all_results.append(result)
 

@@ -28,9 +28,11 @@ MAX_AWARD_AMOUNT = 10_000_000_000  # $10B hard ceiling (skip M&O mega-contracts)
 
 # Value-to-market-cap ratio filter (contract as % of company's market cap)
 # Below MIN: contract too immaterial to move the stock
-# Above MAX: likely signals financial distress or contract-dependent company
-MIN_VALUE_TO_MCAP_PCT = 0.05   # 5% minimum — must be material
-MAX_VALUE_TO_MCAP_PCT = 0.20   # 20% maximum — above this is distress signal
+# Above MAX: zombie/penny stocks with near-zero market cap (contract >> mcap)
+# NOTE: Intentionally wide — high ratios (20-300%) are GOOD signals for small-caps.
+# Scoring already penalizes low ratios. Filter is only a sanity-check for extremes.
+MIN_VALUE_TO_MCAP_PCT = 0.01   # 1% minimum — filter only truly immaterial contracts
+MAX_VALUE_TO_MCAP_PCT = 5.00   # 500% maximum — filter zombie stocks (contract >> mcap)
 
 # Scoring weights (sum = 100)
 SCORE_WEIGHTS = {

@@ -44,10 +44,10 @@ OPT_RESULTS_FILE = os.path.join(os.path.dirname(__file__), "optimizer_results.cs
 # Parameter grid - optimizes: score threshold, EOD take profit, stop loss, hold days
 # Market cap is swept separately inside Phase 2 at MCAP_STEP resolution (not in cartesian product)
 PARAM_GRID = {
-    "score_threshold": list(range(1, 51)),               # 1–50 in 1-point steps
-    "tp_pct":          [i / 100 for i in range(2, 16)], # 2%–15% take profit (EOD close)
-    "sl_pct":          [i / 100 for i in range(1, 9)],  # 1%–8% stop loss (EOD close)
-    "max_hold_days":   [1, 2, 3, 4, 5],                 # days before time exit
+    "score_threshold": list(range(1, 71)),               # 1–70 in 1-point steps
+    "tp_pct":          [i / 100 for i in range(2, 16)], # 2%–15% take profit
+    "sl_pct":          [i / 100 for i in range(1, 9)],  # 1%–8% stop loss
+    "max_hold_days":   [1, 2, 3, 4, 5, 6],              # days before time exit (T1 entry → max T7)
 }
 MCAP_STEP = 10_000_000          # 10M resolution for market cap sweep
 MCAP_MAX  = 5_000_000_000       # upper bound (matches global MAX_MARKET_CAP)
@@ -244,18 +244,33 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
         sim_results = sim_cache[(tp, sl, hold)]
 
         # Collect eligible trades with their market caps (one pass)
+        # Dedup: same (ticker, date) AND overlapping hold-window positions
         eligible = []   # list of (mcap, pnl, peak)
         seen_trades: set = set()
+        ticker_last_entry_opt: dict = {}
         for row_idx, cached in enumerate(row_score_cache):
             if cached is None:
                 continue
             raw_score, extra, row = cached
             if raw_score < threshold:
                 continue
-            key = (row.get("ticker", ""), row.get("posted_date", "")[:10])
+            ticker   = row.get("ticker", "")
+            date_str = normalize_date(row.get("posted_date", ""))[:10]
+            key = (ticker, date_str)
             if key in seen_trades:
                 continue
+            # Skip if a prior position in the same ticker is still within hold window
+            if ticker and ticker in ticker_last_entry_opt:
+                try:
+                    from datetime import date as _date
+                    delta = (_date.fromisoformat(date_str) - _date.fromisoformat(ticker_last_entry_opt[ticker])).days
+                    if 0 < delta <= hold:
+                        continue
+                except (ValueError, TypeError):
+                    pass
             seen_trades.add(key)
+            if ticker:
+                ticker_last_entry_opt[ticker] = date_str
             sim_result = sim_results[row_idx]
             if sim_result:
                 eligible.append((extra.get("market_cap", 0), sim_result[0], sim_result[1]))
@@ -332,19 +347,19 @@ def optimize_from_api(start_date: str, end_date: str, max_records: int = 1000):
 
 
 def _rank_score(stats) -> float:
-    """SQN (Van Tharp System Quality Number): (expectancy / std_dev) * sqrt(min(n, 100)).
+    """Rank by avg_pnl_per_week — directly maximizes expected weekly profit.
 
-    Requires >= 15 trades for statistical validity. Higher is better.
+    This combines expectancy (quality per trade) with trades_per_week (frequency),
+    which is exactly what "make as much money as possible" requires.
+    Requires >= 5 trades for statistical validity.
     """
-    import math
     n = stats.get("trades", 0)
-    if n < 15:
-        return -999
-    exp = stats.get("expectancy", 0)
-    std = stats.get("std_dev_pnl", 0)
-    if std <= 0:
-        return -999
-    return (exp / std) * math.sqrt(min(n, 100))
+    if n < 5:
+        return -999.0
+    tpw = stats.get("trades_per_week", 0)
+    if tpw <= 0:
+        return -999.0
+    return float(stats.get("avg_pnl_per_week", -999.0))
 
 
 def _stats(trades, tp, sl, threshold, hold, max_market_cap=None, date_range_days=None):
@@ -424,25 +439,25 @@ def _stats(trades, tp, sl, threshold, hold, max_market_cap=None, date_range_days
 
 def _print_top10(opt_rows, best_combo):
     print("\n" + "=" * 135)
-    print("  OPTIMIZER RESULTS — TOP 10 BY TOTAL % RETURN")
+    print("  OPTIMIZER RESULTS — TOP 10 BY AVG PNL/WEEK (maximize weekly profit)")
     print("=" * 135)
-    sorted_rows = sorted(opt_rows, key=lambda r: r.get("total_pnl_pct", -999), reverse=True)
+    # Sort by the actual ranking metric so the displayed top-10 matches best_combo logic
+    sorted_rows = sorted(opt_rows, key=lambda r: _rank_score(r), reverse=True)
     print(f"  {'Threshold':>9} {'TP%':>5} {'SL%':>5} {'Hold':>5} {'MaxMcap':>8} "
-          f"{'Trades':>7} {'Total%':>8} {'Trd/Wk':>8} {'PnL/Wk':>8} {'Expect':>8} {'SQN':>7}")
+          f"{'Trades':>7} {'Total%':>8} {'Trd/Wk':>8} {'PnL/Wk':>8} {'Expect':>8} {'WinR%':>6}")
     print("-" * 120)
     for r in sorted_rows[:10]:
-        sqn = _rank_score(r)
-        sqn_str = f"{sqn:.2f}" if sqn > -999 else "n/a"
         mcap = r.get("max_market_cap_m")
         mcap_str = f"${mcap}M" if mcap else "n/a"
         print(f"  {r['score_threshold']:>9} {r['tp_pct']:>4.1f}% {r['sl_pct']:>4.1f}% "
               f"{r['max_hold_days']:>5} {mcap_str:>8} {r['trades']:>7} "
               f"{r['total_pnl_pct']:>+7.2f}% {r.get('trades_per_week', 0):>7.2f} "
-              f"{r.get('avg_pnl_per_week', 0):>+7.2f}% {r['expectancy']:>+7.3f}% {sqn_str:>7}")
+              f"{r.get('avg_pnl_per_week', 0):>+7.2f}% {r['expectancy']:>+7.3f}% "
+              f"{r.get('win_rate', 0):>5.1f}%")
     if best_combo:
         sqn = _rank_score(best_combo)
         mcap = best_combo.get("max_market_cap_m")
-        print(f"\n  >>> BEST COMBO (highest SQN score):")
+        print(f"\n  >>> BEST COMBO (highest avg PnL/week):")
         print(f"      Score Threshold  : {best_combo['score_threshold']}")
         print(f"      Take Profit      : {best_combo['tp_pct']:.1f}%")
         print(f"      Stop Loss        : {best_combo['sl_pct']:.1f}%")

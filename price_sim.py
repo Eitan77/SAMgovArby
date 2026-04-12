@@ -9,6 +9,17 @@ from config import SLIPPAGE_PCT, COMMISSION_PCT
 
 log = logging.getLogger(__name__)
 
+
+def _normalize_date(date_str: str) -> str:
+    """Convert M/D/YYYY or MM/DD/YYYY to YYYY-MM-DD; pass through YYYY-MM-DD unchanged."""
+    if not date_str:
+        return date_str
+    if date_str.count('/') == 2:
+        m, d, y = date_str.split('/')
+        return f"{y}-{int(m):02d}-{int(d):02d}"
+    return date_str
+
+
 # ─── Quarterly data cache (persistent) ─────────────────────────────────────
 _QUARTERLY_CACHE_PATH = os.path.join(os.path.dirname(__file__), ".quarterly_cache.json")
 _quarterly_cache = {}
@@ -218,14 +229,7 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
     stop_loss_price   = entry_price * (1 - stop_loss_pct)
 
     # entry date from open_t0's day index — use posted_date as T0 date
-    entry_date_str = row.get("posted_date", "")
-    # Handle both YYYY-MM-DD and M/D/YYYY formats
-    if entry_date_str and len(entry_date_str) > 0:
-        if entry_date_str.count('/') == 2:  # M/D/YYYY format
-            parts = entry_date_str.split('/')
-            if len(parts) == 3:
-                m, d, y = parts
-                entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    entry_date_str = _normalize_date(row.get("posted_date", ""))
     entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
     ticker = row.get("ticker", "")
 
@@ -290,16 +294,21 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
 def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_hold_days: int):
     """Asymmetric exit simulation: TP on intraday high, SL on EOD close.
 
-    Entry: open_t0 with slippage.
-    Each day N:
-      - TP fires if intraday high_tN >= tp_price  → exit at tp_price (limit order filled)
-      - SL fires if EOD close_tN <= sl_price      → exit at close_tN (close-only, avoids noise)
-      - TP is checked first: if high hits TP and close is also below SL, TP wins
-        (you would have exited intraday before the close)
-    Time exit: close of max_hold_days.
-    MFE tracked via intraday high for reporting.
+    Entry: open_t1 with slippage (day AFTER award date — avoids look-ahead bias).
+    SAM.gov contracts are published during market hours so open_t0 (award date open)
+    would be unavailable at trade time. Entering at open_t1 is realistic.
+
+    Hold period: T1 (entry day) through T{1+max_hold_days}.
+      - Each day: TP fires if high_tN >= tp_price  → exit at tp_price
+      - Each day: SL fires if close_tN <= sl_price → exit at sl_price
+      - TP checked first (intraday fill before close)
+    Time exit: close of T{1+max_hold_days}.
+    MFE tracked via intraday highs.
+
+    Requires: open_t1 through close_t{1+max_hold_days} in row.
+    Max supported max_hold_days = 6 (uses up to close_t7, which is always stored).
     """
-    entry_price_raw = row.get("open_t0", "")
+    entry_price_raw = row.get("open_t1", "")
     if entry_price_raw in ("", None, "None"):
         return None
     try:
@@ -312,29 +321,18 @@ def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_ho
     tp_price = entry_price * (1 + tp_pct)
     sl_price = entry_price * (1 - sl_pct)
 
-    entry_date_str = row.get("posted_date", "")
-    if entry_date_str and entry_date_str.count('/') == 2:
-        m, d, y = entry_date_str.split('/')
-        entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    entry_date_str = _normalize_date(row.get("posted_date", ""))
     try:
-        entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
+        # Display entry date as 1 calendar day after posted_date (approximate)
+        entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d") + timedelta(days=1)
     except ValueError:
         return None
     ticker = row.get("ticker", "")
 
     peak_high = entry_price
 
-    # Check t0 close — if it's already below SL on entry day, exit at SL price
-    close_t0_raw = row.get("close_t0", "")
-    if close_t0_raw not in ("", None, "None"):
-        close_t0 = float(close_t0_raw)
-        if close_t0 <= sl_price:
-            r = _result(ticker, entry_date, entry_price,
-                        entry_date, sl_price, "stop_loss", tp_pct, sl_pct)
-            r["peak_pnl_pct"] = 0.0
-            return r
-
-    for i in range(1, max_hold_days + 1):
+    # Walk T1 (entry day) through T{1+max_hold_days}
+    for i in range(1, max_hold_days + 2):
         high_raw  = row.get(f"high_t{i}", "")
         close_raw = row.get(f"close_t{i}", "")
 
@@ -343,7 +341,7 @@ def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_ho
             for j in range(i - 1, 0, -1):
                 c = row.get(f"close_t{j}", "")
                 if c not in ("", None, "None"):
-                    exit_date = entry_date + timedelta(days=j)
+                    exit_date = entry_date + timedelta(days=j - 1)
                     r = _result(ticker, entry_date, entry_price,
                                 exit_date, float(c), "time_exit", tp_pct, sl_pct)
                     r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
@@ -356,7 +354,7 @@ def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_ho
         if high > peak_high:
             peak_high = high
 
-        exit_date = entry_date + timedelta(days=i)
+        exit_date = entry_date + timedelta(days=i - 1)
 
         # TP checked first: limit order fills intraday when high reaches target
         if high >= tp_price:
@@ -373,8 +371,8 @@ def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_ho
             r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
             return r
 
-    # Time exit: close of last held day
-    last_close_raw = row.get(f"close_t{max_hold_days}", "")
+    # Time exit: close of T{1+max_hold_days}
+    last_close_raw = row.get(f"close_t{1 + max_hold_days}", "")
     if last_close_raw in ("", None, "None"):
         return None
     exit_price = float(last_close_raw)
@@ -410,10 +408,7 @@ def simulate_eod_from_row(row: dict, tp_pct: float, sl_pct: float, max_hold_days
     tp_price = entry_price * (1 + tp_pct)
     sl_price = entry_price * (1 - sl_pct)
 
-    entry_date_str = row.get("posted_date", "")
-    if entry_date_str and entry_date_str.count('/') == 2:
-        m, d, y = entry_date_str.split('/')
-        entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    entry_date_str = _normalize_date(row.get("posted_date", ""))
     try:
         entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
     except ValueError:
@@ -494,10 +489,7 @@ def simulate_ratchet_from_row(row: dict, gap_pct: float, max_hold_days: int):
     peak_gain_pct  = 0.0
     trailing_stop  = entry_price * (1 - gap_pct)
 
-    entry_date_str = row.get("posted_date", "")
-    if entry_date_str and entry_date_str.count('/') == 2:
-        m, d, y = entry_date_str.split('/')
-        entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    entry_date_str = _normalize_date(row.get("posted_date", ""))
     try:
         entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
     except ValueError:
