@@ -15,8 +15,8 @@ import time
 from config_logging import setup_logging, add_verbosity_flags
 from filter_engine_bt import apply_filters_bt_from_training
 from scoring_engine import score_contract
-from price_sim import simulate_trade_from_row
-from config import SCORE_THRESHOLD, TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_HOLD_DAYS
+from price_sim import simulate_asymmetric_from_row
+from config import SCORE_THRESHOLD, TP_PCT, SL_PCT, MAX_HOLD_DAYS
 
 log = logging.getLogger("backtest")
 
@@ -30,7 +30,7 @@ RESULTS_FIELDS = [
     "score", "ticker", "market_cap", "value_to_mcap_pct",
     "entry_date", "entry_price", "exit_date", "exit_price",
     "exit_reason", "pnl_pct", "hit_tp", "hit_sl", "timed_out",
-    "tp_target", "sl_target", "return_t7", "peak_pnl_pct",
+    "tp_pct", "sl_pct", "peak_pnl_pct",
 ]
 
 
@@ -55,6 +55,8 @@ def _build_funnel_breakdown(all_results, training_csv=None):
         # Backtest filters
         "backtest_low_confidence": 0,  # Ticker confidence below minimum
         "backtest_market_cap": 0,
+        "backtest_no_mcap": 0,         # No historical market cap data
+        "backtest_value_to_mcap": 0,   # Contract value-to-mcap ratio out of range
         "backtest_8k": 0,
         "backtest_dilutive": 0,
         "backtest_low_score": 0,
@@ -121,16 +123,20 @@ def _build_funnel_breakdown(all_results, training_csv=None):
         elif fr == "duplicate":
             breakdown["backtest_duplicate"] += 1
         elif fr == "fail":
-            if re.search(r"market cap.*exceeds", reason, re.I):
+            if re.search(r"ticker confidence.*below", reason, re.I):
+                breakdown["backtest_low_confidence"] += 1
+            elif re.search(r"market cap.*exceeds", reason, re.I):
                 breakdown["backtest_market_cap"] += 1
+            elif re.search(r"no historical market cap", reason, re.I):
+                breakdown["backtest_no_mcap"] += 1
+            elif re.search(r"of mcap (below|above)", reason, re.I):
+                breakdown["backtest_value_to_mcap"] += 1
             elif re.search(r"8-K filed", reason, re.I):
                 breakdown["backtest_8k"] += 1
             elif re.search(r"dilutive", reason, re.I):
                 breakdown["backtest_dilutive"] += 1
-            elif re.search(r"ticker confidence.*below", reason, re.I):
-                breakdown["backtest_low_confidence"] += 1
             else:
-                # Catch-all for other fail reasons
+                # Catch-all for truly unrecognized reasons
                 breakdown["backtest_low_confidence"] += 1
 
     # Record actual rows processed by backtest (may differ from stage3 due to
@@ -140,15 +146,13 @@ def _build_funnel_breakdown(all_results, training_csv=None):
     return breakdown
 
 def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
-                 tp: float = TAKE_PROFIT_PCT, sl: float = STOP_LOSS_PCT,
+                 tp: float = TP_PCT, sl: float = SL_PCT,
                  hold: int = MAX_HOLD_DAYS, threshold: int = SCORE_THRESHOLD,
                  output_file: str = RESULTS_FILE,
-                 training_csv: str = None,
-                 max_market_cap: int = None):
+                 training_csv: str = None):
     """Run a backtest from the pre-built training CSV. Returns (stats, breakdown, all_results).
 
     training_csv: path to training_set_final.csv from build_training_set.py (required).
-    max_market_cap: overrides config.MAX_MARKET_CAP for this run.
     """
     if not training_csv:
         raise ValueError(
@@ -156,18 +160,17 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
             "Then pass: --training-csv datasets/training_set_final.csv"
         )
 
-    mcap_str = f" | MaxMCap=${max_market_cap/1e9:.1f}B" if max_market_cap else ""
     log.info(f"Backtest: {start_date} -> {end_date} | "
-             f"TP={tp*100:.0f}% SL={sl*100:.0f}% Hold={hold}d Threshold={threshold}{mcap_str}")
+             f"TP={tp*100:.1f}% SL={sl*100:.1f}% Hold={hold}d Threshold={threshold}")
 
     return _run_backtest_from_training(
         training_csv, start_date, end_date, max_records,
-        tp, sl, hold, threshold, output_file, max_market_cap
+        tp, sl, hold, threshold, output_file
     )
 
 
 def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
-                                tp, sl, hold, threshold, output_file, max_market_cap=None):
+                                tp, sl, hold, threshold, output_file):
     """Run backtest using pre-built training CSV with historical signals."""
     import csv as _csv
 
@@ -205,7 +208,7 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
 
     log.info(f"Processing {total_to_process} awards from training data...")
     for i, row in enumerate(rows[:max_records]):
-        result = _process_training_row(row, tp, sl, hold, threshold, max_market_cap)
+        result = _process_training_row(row, tp, sl, hold, threshold)
 
         # Deduplicate: only one trade per ticker per day
         if result.get("filter_result") == "pass" and result.get("ticker"):
@@ -256,7 +259,7 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     return stats, breakdown, all_results
 
 
-def _process_training_row(row, tp, sl, hold, threshold, max_market_cap=None):
+def _process_training_row(row, tp, sl, hold, threshold):
     """Process one row from the training CSV through filter -> score -> simulate."""
     sole_source = row.get("sole_source", "")
     if isinstance(sole_source, str):
@@ -272,7 +275,7 @@ def _process_training_row(row, tp, sl, hold, threshold, max_market_cap=None):
     }
 
     # Filter using historical data
-    passed, reason, extra = apply_filters_bt_from_training(row, max_market_cap=max_market_cap)
+    passed, reason, extra = apply_filters_bt_from_training(row)
     base["filter_result"] = "pass" if passed else "fail"
     base["filter_reason"] = reason
     base["first_8k_date"] = extra.get("first_8k_date", "")
@@ -328,7 +331,7 @@ def _process_training_row(row, tp, sl, hold, threshold, max_market_cap=None):
         return base
 
     # Simulate price action using stored OHLC (no API call)
-    sim = simulate_trade_from_row(row, tp, sl, hold)
+    sim = simulate_asymmetric_from_row(row, tp, sl, hold)
     if sim:
         base.update({k: sim[k] for k in sim if k != "ticker"})
         # Add 7-day return from original row
@@ -351,25 +354,22 @@ def _compute_stats(traded, tp, sl):
 
     pnls = [float(t["pnl_pct"]) for t in traded if t.get("pnl_pct") != ""]
     peak_pnls = [float(t["peak_pnl_pct"]) for t in traded if t.get("peak_pnl_pct") not in ("", None, "None")]
-    wins = [p for p in pnls if p > 0]
+    wins   = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
 
-    tp_hits = sum(1 for t in traded if t.get("hit_tp") in [True, "True"])
-    sl_hits = sum(1 for t in traded if t.get("hit_sl") in [True, "True"])
-    timeouts = sum(1 for t in traded if t.get("timed_out") in [True, "True"])
+    tp_hits   = sum(1 for t in traded if t.get("hit_tp") in [True, "True"])
+    sl_hits   = sum(1 for t in traded if t.get("hit_sl") in [True, "True"])
+    timeouts  = sum(1 for t in traded if t.get("timed_out") in [True, "True"])
 
-    avg_pnl = sum(pnls) / len(pnls) if pnls else 0
+    avg_pnl  = sum(pnls) / len(pnls) if pnls else 0
     win_rate = len(wins) / len(pnls) * 100 if pnls else 0
 
-    # Max drawdown (simple, on pnl_pct stream)
-    cumulative = 0
-    peak = 0
-    max_dd = 0
+    cumulative, peak_cum, max_dd = 0, 0, 0
     for p in pnls:
         cumulative += p
-        if cumulative > peak:
-            peak = cumulative
-        dd = peak - cumulative
+        if cumulative > peak_cum:
+            peak_cum = cumulative
+        dd = peak_cum - cumulative
         if dd > max_dd:
             max_dd = dd
 
@@ -386,8 +386,8 @@ def _compute_stats(traded, tp, sl):
         "worst_trade": round(min(pnls), 2) if pnls else 0,
         "avg_peak_pnl_pct": round(sum(peak_pnls) / len(peak_pnls), 3) if peak_pnls else 0,
         "best_peak_pnl_pct": round(max(peak_pnls), 2) if peak_pnls else 0,
-        "tp_pct": tp * 100,
-        "sl_pct": sl * 100,
+        "tp_pct": round(tp * 100, 1),
+        "sl_pct": round(sl * 100, 1),
     }
 
 
@@ -418,7 +418,8 @@ def _print_report(stats, all_results, traded, start_date, end_date):
         print(f"  Total P&L (sum)        : {stats['total_pnl_pct']:+.2f}%")
         print(f"  Max Drawdown           : -{stats['max_drawdown_pct']:.2f}%")
         print(f"  Best / Worst trade     : {stats['best_trade']:+.2f}% / {stats['worst_trade']:+.2f}%")
-        print(f"  TP hits / SL hits / TO : {stats['tp_hits']} / {stats['sl_hits']} / {stats['timeouts']}")
+        print(f"  TP hits / SL hits / TO : {stats.get('tp_hits', 0)} / {stats.get('sl_hits', 0)} / {stats['timeouts']}")
+        print(f"  TP / SL targets        : +{stats.get('tp_pct', 0):.1f}% / -{stats.get('sl_pct', 0):.1f}%")
         print(f"  Avg Peak Return (MFE)  : {stats['avg_peak_pnl_pct']:+.2f}%")
         print(f"  Best Peak Return       : {stats['best_peak_pnl_pct']:+.2f}%")
 
@@ -488,20 +489,19 @@ if __name__ == "__main__":
     parser.add_argument("--end", required=True, help="End date YYYY-MM-DD")
     parser.add_argument("--max-records", type=int, default=2000)
     parser.add_argument("--no-cache", action="store_true", help="Skip cache, fetch fresh")
-    parser.add_argument("--tp", type=float, default=TAKE_PROFIT_PCT, help="Take profit fraction (e.g. 0.15)")
-    parser.add_argument("--sl", type=float, default=STOP_LOSS_PCT, help="Stop loss fraction (e.g. 0.07)")
+    parser.add_argument("--tp", type=float, default=TP_PCT,
+                        help="Take profit fraction EOD close (e.g. 0.04 for 4%%)")
+    parser.add_argument("--sl", type=float, default=SL_PCT,
+                        help="Stop loss fraction EOD close (e.g. 0.025 for 2.5%%)")
     parser.add_argument("--hold", type=int, default=MAX_HOLD_DAYS, help="Max hold days")
     parser.add_argument("--threshold", type=int, default=SCORE_THRESHOLD, help="Score threshold")
     parser.add_argument("--watchlist", action="store_true", help="Use watchlist mode (known small-cap defense stocks)")
     parser.add_argument("--dataset", type=str, default=None, help="Path to pre-built dataset JSON from bulk_builder.py")
     parser.add_argument("--training-csv", type=str, default=None,
                         help="Path to training CSV from build_training_set.py (uses historical 8-K, PR, market cap)")
-    parser.add_argument("--max-market-cap", type=int, default=None,
-                        help="Override MAX_MARKET_CAP for this run (in dollars)")
     add_verbosity_flags(parser)
     args = parser.parse_args()
 
-    # Initialize logger with user's verbosity preference
     log = setup_logging("backtest", quiet=args.quiet, verbose=args.verbose, json_format=args.json)
 
     run_backtest(
@@ -514,5 +514,4 @@ if __name__ == "__main__":
         threshold=args.threshold,
         training_csv=args.training_csv,
         output_file=RESULTS_FILE,
-        max_market_cap=args.max_market_cap,
     )

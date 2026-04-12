@@ -75,11 +75,11 @@ def score_contract(contract, market_cap, agency_history=None, threshold=None,
 
     # Factor 5: No simultaneous press release (max w["no_pr"] pts)
     if has_press_release is True:
-        pts = 0   # confirmed PR exists — no information edge
+        pts = 0           # confirmed PR exists — no information edge
     elif has_press_release is False:
         pts = w["no_pr"]  # confirmed no PR — full points
     else:
-        pts = 0   # unknown/None — conservative: don't award points for missing data
+        pts = w["no_pr"] // 2  # unknown — partial credit (most contracts don't issue PRs)
     breakdown["no_press_release"] = {"points": pts, "max": w["no_pr"]}
 
     total = sum(f["points"] for f in breakdown.values())

@@ -2,7 +2,8 @@
 from __future__ import annotations
 import logging
 from datetime import datetime
-from config import (MAX_MARKET_CAP, MIN_CONTRACT_VALUE,
+from config import (MIN_CONTRACT_VALUE, MAX_MARKET_CAP,
+                    MIN_VALUE_TO_MCAP_PCT, MAX_VALUE_TO_MCAP_PCT,
                     MAX_8K_WINDOW_DAYS, MAX_DILUTIVE_WINDOW_DAYS,
                     MAX_PR_WINDOW_DAYS, MIN_TICKER_CONFIDENCE)
 
@@ -42,15 +43,13 @@ def _days_signed(earlier_str, later_str) -> int | None:
         return None
 
 
-def apply_filters_bt_from_training(row, max_market_cap=None):
+def apply_filters_bt_from_training(row):
     """Filter using pre-computed historical data from the training CSV.
 
     Uses date-based columns for tunable window filtering.
-    max_market_cap: override for MAX_MARKET_CAP (used by optimizer/backtest per-run).
     Returns (passed: bool, reason: str, extra: dict).
     """
     extra = {}
-    effective_mcap_limit = max_market_cap if max_market_cap is not None else MAX_MARKET_CAP
 
     # Filter 1: Minimum contract value
     award_amount = float(row.get("award_amount", 0))
@@ -77,8 +76,16 @@ def apply_filters_bt_from_training(row, max_market_cap=None):
     if hist_mcap <= 0:
         return False, "No historical market cap data", extra
 
-    if hist_mcap > effective_mcap_limit:
-        return False, f"Historical market cap ${hist_mcap/1e6:.0f}M exceeds ${effective_mcap_limit/1e6:.0f}M limit", extra
+    if hist_mcap > MAX_MARKET_CAP:
+        return False, f"Historical market cap ${hist_mcap:,.0f} exceeds ${MAX_MARKET_CAP:,.0f} limit", extra
+
+    # Filter 3b: Value-to-market-cap ratio — contract must be material but not a distress signal
+    award_amount = float(row.get("award_amount", 0))
+    value_to_mcap = award_amount / hist_mcap
+    if value_to_mcap < MIN_VALUE_TO_MCAP_PCT:
+        return False, f"Contract {value_to_mcap*100:.2f}% of mcap below {MIN_VALUE_TO_MCAP_PCT*100:.0f}% minimum (too immaterial)", extra
+    if value_to_mcap > MAX_VALUE_TO_MCAP_PCT:
+        return False, f"Contract {value_to_mcap*100:.2f}% of mcap above {MAX_VALUE_TO_MCAP_PCT*100:.0f}% maximum (distress signal)", extra
 
     # Filter 4: 8-K check — reject if 8-K filed ON OR AFTER award within window
     award_date = row.get("posted_date", "")

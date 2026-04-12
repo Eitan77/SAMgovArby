@@ -26,6 +26,12 @@ MAX_MARKET_CAP = 5_000_000_000  # $5B (wide net — optimizer tunes the real cut
 MIN_CONTRACT_VALUE = 1_000_000  # $1M
 MAX_AWARD_AMOUNT = 10_000_000_000  # $10B hard ceiling (skip M&O mega-contracts)
 
+# Value-to-market-cap ratio filter (contract as % of company's market cap)
+# Below MIN: contract too immaterial to move the stock
+# Above MAX: likely signals financial distress or contract-dependent company
+MIN_VALUE_TO_MCAP_PCT = 0.05   # 5% minimum — must be material
+MAX_VALUE_TO_MCAP_PCT = 0.20   # 20% maximum — above this is distress signal
+
 # Scoring weights (sum = 100)
 SCORE_WEIGHTS = {
     "value_to_mcap": 30,    # contract value as % of market cap
@@ -34,7 +40,7 @@ SCORE_WEIGHTS = {
     "hot_sector":    15,    # NAICS in hot sector
     "no_pr":         15,    # no simultaneous press release
 }
-SCORE_THRESHOLD = 40
+SCORE_THRESHOLD = 30
 
 # ─── SAM.gov API Configuration ──────────────────────────────────────────────────
 
@@ -47,11 +53,14 @@ SAM_GOV_RETRY_BACKOFF_FACTOR = 2.0
 SAM_GOV_TIMEOUT_SEC = 30  # HTTP request timeout
 SAM_GOV_API_KEY = "SAM-178836eb-f9ad-4c50-9872-dc258dba2521"  # WARN: Do not commit this to git
 
-# Bracket order params
-TAKE_PROFIT_PCT = 0.08  # +8%
-STOP_LOSS_PCT = 0.07    # -7%
+# EOD exit params (primary)
+TP_PCT = 0.04           # 4% take profit — checked at end-of-day close
+SL_PCT = 0.025          # 2.5% stop loss — checked at end-of-day close
+MAX_HOLD_DAYS = 3       # trading days before time exit
+
+# Ratchet (trailing stop) params — kept for backwards compat with old backtest runs
+GAP_PCT = 0.02          # 2% trailing gap — stop = entry + peak_gain - gap
 POSITION_SIZE = 200     # $ per trade
-MAX_HOLD_DAYS = 4       # trading days
 
 # Backtest realism: slippage + commission
 SLIPPAGE_PCT = 0.005    # 0.5% adverse fill per side
@@ -119,4 +128,4 @@ POLL_INTERVAL_HOURS = 1
 MAX_8K_WINDOW_DAYS = 2          # reject if 8-K filed within N days of award
 MAX_DILUTIVE_WINDOW_DAYS = 60   # reject if S-1/S-3 within N days before award
 MAX_PR_WINDOW_DAYS = 2          # PR within N days counts as "already public"
-MIN_TICKER_CONFIDENCE = "medium"   # minimum resolver confidence to accept
+MIN_TICKER_CONFIDENCE = "low"      # minimum resolver confidence to accept

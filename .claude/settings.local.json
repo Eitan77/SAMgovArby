@@ -25,7 +25,9 @@
       "Bash(curl -s -H \"User-Agent: research@example.com\" https://www.sec.gov/files/company_tickers.json)",
       "mcp__rtk__run_command",
       "Bash(python -c \":*)",
-      "Bash(ls datasets/*.json)"
+      "Bash(ls datasets/*.json)",
+      "Bash(kill %1)",
+      "Bash(rtk read:*)"
     ]
   }
 }

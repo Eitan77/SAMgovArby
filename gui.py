@@ -978,14 +978,12 @@ class BacktestTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._trades_window = None
-        self._optimizer_max_mcap_m = 500  # Store max_mcap_M from optimizer (in millions)
         self._build_ui()
         # Defer load so startup isn't blocked
         QTimer.singleShot(200, self._load_results)
 
-    def apply_optimizer_params(self, tp: float, sl: float, hold: int, threshold: int, max_mcap_m: int = 500):
+    def apply_optimizer_params(self, tp: float, sl: float, hold: int, threshold: int):
         """Called from OptimizerTab to push best params here."""
-        self._optimizer_max_mcap_m = max_mcap_m
         self._mode_combo.setCurrentIndex(1)   # switch to "Optimized"
         self._tp.setValue(tp)
         self._sl.setValue(sl)
@@ -1028,17 +1026,17 @@ class BacktestTab(QWidget):
         pf.setSpacing(6)
 
         self._tp = QDoubleSpinBox()
-        self._tp.setRange(0.01, 0.50); self._tp.setSingleStep(0.01); self._tp.setValue(0.08)
-        self._tp.setDecimals(2); self._tp.setSuffix("  (8%)")
+        self._tp.setRange(0.01, 0.25); self._tp.setSingleStep(0.01); self._tp.setValue(0.04)
+        self._tp.setDecimals(2); self._tp.setSuffix("  (4%)")
         self._tp.valueChanged.connect(lambda v: self._tp.setSuffix(f"  ({v*100:.0f}%)"))
 
         self._sl = QDoubleSpinBox()
-        self._sl.setRange(0.01, 0.50); self._sl.setSingleStep(0.01); self._sl.setValue(0.07)
-        self._sl.setDecimals(2); self._sl.setSuffix("  (7%)")
-        self._sl.valueChanged.connect(lambda v: self._sl.setSuffix(f"  ({v*100:.0f}%)"))
+        self._sl.setRange(0.005, 0.15); self._sl.setSingleStep(0.005); self._sl.setValue(0.025)
+        self._sl.setDecimals(3); self._sl.setSuffix("  (2.5%)")
+        self._sl.valueChanged.connect(lambda v: self._sl.setSuffix(f"  ({v*100:.1f}%)"))
 
         self._hold = QSpinBox()
-        self._hold.setRange(1, 30); self._hold.setValue(4); self._hold.setSuffix(" days")
+        self._hold.setRange(1, 5); self._hold.setValue(3); self._hold.setSuffix(" days")
 
         self._threshold = QSpinBox()
         self._threshold.setRange(0, 100); self._threshold.setValue(40)
@@ -1133,22 +1131,20 @@ class BacktestTab(QWidget):
         headers, rows = _load_csv(OUTPUT_FILES["optimizer"])
         if not rows:
             return
-        # Sort by total_pnl_pct descending to get best row
+        # Sort by SQN descending to get best row
         try:
-            rows.sort(key=lambda r: float(r.get("total_pnl_pct", 0)), reverse=True)
+            rows.sort(key=lambda r: _rank_score_gui(r), reverse=True)
         except Exception:
             pass
         best = rows[0]
-        try: self._tp.setValue(float(best.get("tp_pct", 8.0)) / 100)  # stored as 8.0, convert to 0.08
+        try: self._tp.setValue(float(best.get("tp_pct", 4.0)) / 100)
         except Exception as e: log.warning(f"Non-critical error setting tp value: {e}")
-        try: self._sl.setValue(float(best.get("sl_pct", 7.0)) / 100)
+        try: self._sl.setValue(float(best.get("sl_pct", 2.5)) / 100)
         except Exception as e: log.warning(f"Non-critical error setting sl value: {e}")
-        try: self._hold.setValue(int(float(best.get("max_hold_days", 4))))
+        try: self._hold.setValue(int(float(best.get("max_hold_days", 3))))
         except Exception as e: log.warning(f"Non-critical error setting hold value: {e}")
         try: self._threshold.setValue(int(float(best.get("score_threshold", 40))))
         except Exception as e: log.warning(f"Non-critical error setting threshold value: {e}")
-        try: self._optimizer_max_mcap_m = int(float(best.get("max_mcap_M", 500)))
-        except Exception as e: log.warning(f"Non-critical error setting max_mcap value: {e}")
 
     def _run_backtest(self):
         ds = DATASET_CONFIGS[self._dataset_combo.currentText()]
@@ -1163,7 +1159,6 @@ class BacktestTab(QWidget):
             "--sl",          str(self._sl.value()),
             "--hold",        str(self._hold.value()),
             "--threshold",   str(self._threshold.value()),
-            "--max-market-cap", str(self._optimizer_max_mcap_m * 1_000_000),
         ]
         if ds["stage3"].exists():
             args += ["--training-csv", training_csv]
@@ -1237,7 +1232,7 @@ class BacktestTab(QWidget):
             row3 = QHBoxLayout()
             row3.setSpacing(6)
             for label, value, color in [
-                ("TP Exits",        f"{stats['tp_pct']:.0f}%",              "#89b4fa"),
+                ("TP Exits",         f"{stats['tp_pct']:.0f}%",              "#a6e3a1"),
                 ("SL Exits",        f"{stats['sl_pct']:.0f}%",              "#f38ba8"),
                 ("Timeouts",        f"{stats['timeout_pct']:.0f}%",         "#a6adc8"),
                 ("Peak Intraday",   f"{stats['avg_peak_intraday']:+.2f}%",  "#fab387"),
@@ -1360,9 +1355,8 @@ class BacktestTab(QWidget):
         def pct_bt(c):
             return f"({c*100/bt_base:.1f}%)"
 
-        # Dynamic market-cap label from breakdown data
-        mcap_removals = breakdown.get("backtest_market_cap", 0)
-        mcap_label = f"    ├─ Removed: Market Cap > ${self._optimizer_max_mcap_m}M"
+        # Market cap filter removed — label is static now
+        mcap_label = "    ├─ Removed: Market Cap (disabled)"
 
         # Build complete funnel
         items = [
@@ -1430,9 +1424,22 @@ class BacktestTab(QWidget):
 
 # ─── OptimizerTab ─────────────────────────────────────────────────────────────
 
+def _rank_score_gui(row: dict) -> float:
+    """Compute SQN for display. Mirrors optimizer._rank_score."""
+    import math
+    n = int(float(row.get("trades", 0) or 0))
+    if n < 15:
+        return -999.0
+    exp = float(row.get("expectancy", 0) or 0)
+    std = float(row.get("std_dev_pnl", 0) or 0)
+    if std <= 0:
+        return -999.0
+    return (exp / std) * math.sqrt(min(n, 100))
+
+
 class OptimizerTab(QWidget):
-    # Signal to push best params to the BacktestTab (tp, sl, hold, threshold, max_mcap_m)
-    apply_params = pyqtSignal(float, float, int, int, int)
+    # Signal to push best params to the BacktestTab (tp, sl, hold, threshold)
+    apply_params = pyqtSignal(float, float, int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1546,9 +1553,9 @@ class OptimizerTab(QWidget):
             WATCHER.refresh_watch(path)
             return
 
-        # Sort best first
+        # Sort by SQN descending (best first)
         try:
-            rows.sort(key=lambda r: float(r.get("total_pnl_pct", 0)), reverse=True)
+            rows.sort(key=lambda r: _rank_score_gui(r), reverse=True)
         except Exception:
             pass
         self._best_row = rows[0] if rows else {}
@@ -1563,40 +1570,55 @@ class OptimizerTab(QWidget):
         if not best:
             return
 
-        # Row 1: param cards
-        row1 = QHBoxLayout(); row1.setSpacing(6)
-        def _pct(key, default=""):
+        def _flt(key, default=0):
+            try: return float(best.get(key, default) or default)
+            except Exception: return float(default)
+        def _val(key, default="—"):
             v = best.get(key, default)
-            try: return f"{float(v)/100:.1%}"  # stored as 8.0 → 8.0%
-            except Exception: return str(v)
-        def _val(key, default=""):
-            return best.get(key, default)
+            return str(v) if v not in (None, "", "None") else "—"
 
+        # Row 1: optimized parameters
+        row1 = QHBoxLayout(); row1.setSpacing(6)
         for label, value, color in [
-            ("Threshold",  _val("score_threshold"), "#89b4fa"),
-            ("Take Profit",_pct("tp_pct"),          "#a6e3a1"),
-            ("Stop Loss",  _pct("sl_pct"),           "#f38ba8"),
-            ("Hold Days",  _val("max_hold_days"),    "#cdf4f4"),
-            ("Max Mkt Cap", (lambda m: f"${m/1000:.1f}B" if m >= 1000 else f"${m:.0f}M")(
-                                float(_val("max_mcap_M") or _val("max_market_cap_M") or 0))
-                            if (_val("max_mcap_M") or _val("max_market_cap_M")) else "—", "#f9e2af"),
+            ("Score Threshold", _val("score_threshold"),        "#89b4fa"),
+            ("Take Profit",     f"{_flt('tp_pct'):.1f}%",      "#a6e3a1"),
+            ("Stop Loss",       f"{_flt('sl_pct'):.1f}%",      "#f38ba8"),
+            ("Hold Days",       _val("max_hold_days"),          "#cdf4f4"),
         ]:
             row1.addWidget(_make_stat_card(label, value, color))
         self._best_lay.addLayout(row1)
 
-        # Row 2: result cards
+        # Row 2: volume and return metrics
         row2 = QHBoxLayout(); row2.setSpacing(6)
-        pnl = float(best.get("total_pnl_pct", 0))
-        wr  = float(best.get("win_rate", 0))
+        trades_n   = int(_flt("trades"))
+        tpw        = _flt("trades_per_week")
+        total_pnl  = _flt("total_pnl_pct")
+        pnl_pw     = _flt("avg_pnl_per_week")
         for label, value, color in [
-            ("Total Return",  f"{pnl:+.2f}%",              "#a6e3a1" if pnl >= 0 else "#f38ba8"),
-            ("Win Rate",      f"{float(best.get('win_rate', 0)):.1f}%",
-                               "#a6e3a1" if wr >= 50 else "#f38ba8"),
-            ("Trades",        _val("trades"),               "#cdd6f4"),
-            ("Expectancy",    f"{float(best.get('expectancy', 0)):+.2f}%", "#cdd6f4"),
+            ("Trades",         str(trades_n),              "#cdd6f4"),
+            ("Trades / Week",  f"{tpw:.2f}",               "#cdd6f4"),
+            ("Total Return",   f"{total_pnl:+.2f}%",       "#a6e3a1" if total_pnl >= 0 else "#f38ba8"),
+            ("Avg PnL / Week", f"{pnl_pw:+.2f}%",          "#a6e3a1" if pnl_pw >= 0 else "#f38ba8"),
         ]:
             row2.addWidget(_make_stat_card(label, value, color))
         self._best_lay.addLayout(row2)
+
+        # Row 3: per-trade quality
+        row3 = QHBoxLayout(); row3.setSpacing(6)
+        wr       = _flt("win_rate")
+        avg_pnl  = _flt("avg_pnl_pct")
+        avg_win  = _flt("avg_win")
+        avg_loss = _flt("avg_loss")
+        sqn      = _rank_score_gui(best)
+        for label, value, color in [
+            ("Win Rate",      f"{wr:.1f}%",            "#a6e3a1" if wr >= 50 else "#f38ba8"),
+            ("Avg PnL/Trade", f"{avg_pnl:+.3f}%",      "#a6e3a1" if avg_pnl >= 0 else "#f38ba8"),
+            ("Avg Win",       f"+{avg_win:.3f}%",       "#a6e3a1"),
+            ("Avg Loss",      f"-{avg_loss:.3f}%",      "#f38ba8"),
+            ("SQN Score",     f"{sqn:.2f}" if sqn > -999 else "n/a", "#f9e2af"),
+        ]:
+            row3.addWidget(_make_stat_card(label, value, color))
+        self._best_lay.addLayout(row3)
 
         self._apply_btn.setEnabled(True)
         self._view_all_btn.setEnabled(True)
@@ -1607,12 +1629,11 @@ class OptimizerTab(QWidget):
         if not b:
             return
         try:
-            tp  = float(b.get("tp_pct", 8.0)) / 100  # stored as 8.0, convert to 0.08
-            sl  = float(b.get("sl_pct", 7.0)) / 100
-            hold = int(float(b.get("max_hold_days", 4)))
+            tp   = float(b.get("tp_pct", 4.0)) / 100
+            sl   = float(b.get("sl_pct", 2.5)) / 100
+            hold = int(float(b.get("max_hold_days", 3)))
             thr  = int(float(b.get("score_threshold", 40)))
-            max_mcap_m = int(float(b.get("max_mcap_M", 500)))  # in millions
-            self.apply_params.emit(tp, sl, hold, thr, max_mcap_m)
+            self.apply_params.emit(tp, sl, hold, thr)
         except Exception:
             pass
 

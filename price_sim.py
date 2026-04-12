@@ -287,6 +287,342 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
     return r
 
 
+def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_hold_days: int):
+    """Asymmetric exit simulation: TP on intraday high, SL on EOD close.
+
+    Entry: open_t0 with slippage.
+    Each day N:
+      - TP fires if intraday high_tN >= tp_price  → exit at tp_price (limit order filled)
+      - SL fires if EOD close_tN <= sl_price      → exit at close_tN (close-only, avoids noise)
+      - TP is checked first: if high hits TP and close is also below SL, TP wins
+        (you would have exited intraday before the close)
+    Time exit: close of max_hold_days.
+    MFE tracked via intraday high for reporting.
+    """
+    entry_price_raw = row.get("open_t0", "")
+    if entry_price_raw in ("", None, "None"):
+        return None
+    try:
+        entry_price = float(entry_price_raw) * (1 + SLIPPAGE_PCT)
+    except (ValueError, TypeError):
+        return None
+    if entry_price <= 0:
+        return None
+
+    tp_price = entry_price * (1 + tp_pct)
+    sl_price = entry_price * (1 - sl_pct)
+
+    entry_date_str = row.get("posted_date", "")
+    if entry_date_str and entry_date_str.count('/') == 2:
+        m, d, y = entry_date_str.split('/')
+        entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    try:
+        entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    ticker = row.get("ticker", "")
+
+    peak_high = entry_price
+
+    # Check t0 close — if it's already below SL on entry day, exit at SL price
+    close_t0_raw = row.get("close_t0", "")
+    if close_t0_raw not in ("", None, "None"):
+        close_t0 = float(close_t0_raw)
+        if close_t0 <= sl_price:
+            r = _result(ticker, entry_date, entry_price,
+                        entry_date, sl_price, "stop_loss", tp_pct, sl_pct)
+            r["peak_pnl_pct"] = 0.0
+            return r
+
+    for i in range(1, max_hold_days + 1):
+        high_raw  = row.get(f"high_t{i}", "")
+        close_raw = row.get(f"close_t{i}", "")
+
+        if high_raw in ("", None, "None"):
+            # Ran out of stored data — time exit on last available close
+            for j in range(i - 1, 0, -1):
+                c = row.get(f"close_t{j}", "")
+                if c not in ("", None, "None"):
+                    exit_date = entry_date + timedelta(days=j)
+                    r = _result(ticker, entry_date, entry_price,
+                                exit_date, float(c), "time_exit", tp_pct, sl_pct)
+                    r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+                    return r
+            return None
+
+        high  = float(high_raw)
+        close = float(close_raw) if close_raw not in ("", None, "None") else entry_price
+
+        if high > peak_high:
+            peak_high = high
+
+        exit_date = entry_date + timedelta(days=i)
+
+        # TP checked first: limit order fills intraday when high reaches target
+        if high >= tp_price:
+            r = _result(ticker, entry_date, entry_price,
+                        exit_date, tp_price, "take_profit", tp_pct, sl_pct)
+            r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+            return r
+
+        # SL checked on EOD close only — avoids intraday noise stop-outs
+        # Exit at sl_price (not close) so losses are capped at the stop level
+        if close <= sl_price:
+            r = _result(ticker, entry_date, entry_price,
+                        exit_date, sl_price, "stop_loss", tp_pct, sl_pct)
+            r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+            return r
+
+    # Time exit: close of last held day
+    last_close_raw = row.get(f"close_t{max_hold_days}", "")
+    if last_close_raw in ("", None, "None"):
+        return None
+    exit_price = float(last_close_raw)
+    exit_date = entry_date + timedelta(days=max_hold_days)
+    r = _result(ticker, entry_date, entry_price,
+                exit_date, exit_price, "time_exit", tp_pct, sl_pct)
+    r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+    return r
+
+
+def simulate_eod_from_row(row: dict, tp_pct: float, sl_pct: float, max_hold_days: int):
+    """EOD close-based fixed TP/SL simulation using stored OHLC columns.
+
+    Entry: open_t0 with slippage.
+    Exit conditions checked at end-of-day close only (not intraday highs/lows):
+      - TP: close_tN >= entry * (1 + tp_pct)
+      - SL: close_tN <= entry * (1 - sl_pct)
+      - Time: close of day max_hold_days
+
+    Peak (MFE) is still tracked via intraday high for reporting purposes only.
+    Returns same dict shape as simulate_trade_from_row, or None if data missing.
+    """
+    entry_price_raw = row.get("open_t0", "")
+    if entry_price_raw in ("", None, "None"):
+        return None
+    try:
+        entry_price = float(entry_price_raw) * (1 + SLIPPAGE_PCT)
+    except (ValueError, TypeError):
+        return None
+    if entry_price <= 0:
+        return None
+
+    tp_price = entry_price * (1 + tp_pct)
+    sl_price = entry_price * (1 - sl_pct)
+
+    entry_date_str = row.get("posted_date", "")
+    if entry_date_str and entry_date_str.count('/') == 2:
+        m, d, y = entry_date_str.split('/')
+        entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    try:
+        entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    ticker = row.get("ticker", "")
+
+    peak_high = entry_price
+
+    for i in range(1, max_hold_days + 1):
+        close_raw = row.get(f"close_t{i}", "")
+        high_raw  = row.get(f"high_t{i}", "")
+
+        if close_raw in ("", None, "None"):
+            # Ran out of stored data — time exit on last available close
+            for j in range(i - 1, 0, -1):
+                c = row.get(f"close_t{j}", "")
+                if c not in ("", None, "None"):
+                    exit_date = entry_date + timedelta(days=j)
+                    r = _result(ticker, entry_date, entry_price,
+                                exit_date, float(c), "time_exit", tp_pct, sl_pct)
+                    r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+                    return r
+            return None
+
+        close = float(close_raw)
+
+        # Track intraday peak for MFE reporting only — not used for exit decisions
+        if high_raw not in ("", None, "None"):
+            high = float(high_raw)
+            if high > peak_high:
+                peak_high = high
+
+        exit_date = entry_date + timedelta(days=i)
+
+        # SL checked first (conservative)
+        if close <= sl_price:
+            r = _result(ticker, entry_date, entry_price,
+                        exit_date, close, "stop_loss", tp_pct, sl_pct)
+            r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+            return r
+
+        if close >= tp_price:
+            r = _result(ticker, entry_date, entry_price,
+                        exit_date, close, "take_profit", tp_pct, sl_pct)
+            r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+            return r
+
+    # Time exit: close of last held day
+    last_close_raw = row.get(f"close_t{max_hold_days}", "")
+    if last_close_raw in ("", None, "None"):
+        return None
+    exit_price = float(last_close_raw)
+    exit_date = entry_date + timedelta(days=max_hold_days)
+    r = _result(ticker, entry_date, entry_price,
+                exit_date, exit_price, "time_exit", tp_pct, sl_pct)
+    r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
+    return r
+
+
+def simulate_ratchet_from_row(row: dict, gap_pct: float, max_hold_days: int):
+    """Trailing-stop (ratchet) simulation using stored OHLC columns.
+
+    Entry: open_t0 with slippage.
+    Stop:  trails peak on an absolute basis — stop = entry * (1 + peak_gain - gap_pct).
+           Starts at entry * (1 - gap_pct). Ratchets up with gains, never down.
+    Exit:  day's low breaches trailing stop, OR max_hold_days elapsed.
+    """
+    entry_price_raw = row.get("open_t0", "")
+    if entry_price_raw in ("", None, "None"):
+        return None
+    try:
+        entry_price = float(entry_price_raw) * (1 + SLIPPAGE_PCT)
+    except (ValueError, TypeError):
+        return None
+    if entry_price <= 0:
+        return None
+
+    peak_gain_pct  = 0.0
+    trailing_stop  = entry_price * (1 - gap_pct)
+
+    entry_date_str = row.get("posted_date", "")
+    if entry_date_str and entry_date_str.count('/') == 2:
+        m, d, y = entry_date_str.split('/')
+        entry_date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    try:
+        entry_date = datetime.strptime(entry_date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    ticker = row.get("ticker", "")
+
+    for i in range(1, max_hold_days + 1):
+        high_raw  = row.get(f"high_t{i}", "")
+        low_raw   = row.get(f"low_t{i}", "")
+        close_raw = row.get(f"close_t{i}", "")
+
+        if high_raw in ("", None, "None"):
+            # Ran out of stored data — time exit on last available close
+            for j in range(i - 1, 0, -1):
+                c = row.get(f"close_t{j}", "")
+                if c not in ("", None, "None"):
+                    exit_date = entry_date + timedelta(days=j)
+                    return _ratchet_result(ticker, entry_date, entry_price,
+                                          exit_date, float(c), "time_exit",
+                                          gap_pct, peak_gain_pct)
+            return None
+
+        high = float(high_raw)
+        low  = float(low_raw)
+
+        # Check stop breach before updating peak (stop is from start of day)
+        if low <= trailing_stop:
+            exit_date = entry_date + timedelta(days=i)
+            return _ratchet_result(ticker, entry_date, entry_price,
+                                   exit_date, trailing_stop, "trailing_stop",
+                                   gap_pct, peak_gain_pct)
+
+        # Ratchet up peak and trailing stop with today's high
+        day_gain = (high - entry_price) / entry_price
+        if day_gain > peak_gain_pct:
+            peak_gain_pct = day_gain
+            trailing_stop = entry_price * (1 + peak_gain_pct - gap_pct)
+
+    # Time exit: close of last held day
+    last_close_raw = row.get(f"close_t{max_hold_days}", "")
+    if last_close_raw in ("", None, "None"):
+        return None
+    exit_date = entry_date + timedelta(days=max_hold_days)
+    return _ratchet_result(ticker, entry_date, entry_price,
+                           exit_date, float(last_close_raw), "time_exit",
+                           gap_pct, peak_gain_pct)
+
+
+def simulate_ratchet(ticker: str, award_date: str, gap_pct: float, max_hold_days: int):
+    """Trailing-stop simulation using yfinance price data (for from-cache mode)."""
+    award_dt = datetime.strptime(award_date[:10], "%Y-%m-%d")
+    fetch_start = award_dt - timedelta(days=1)
+    fetch_end   = award_dt + timedelta(days=max_hold_days + 10)
+    try:
+        df = yf.download(ticker,
+                         start=fetch_start.strftime("%Y-%m-%d"),
+                         end=fetch_end.strftime("%Y-%m-%d"),
+                         progress=False, auto_adjust=True)
+    except Exception as e:
+        log.warning(f"yfinance download failed for {ticker}: {e}")
+        return None
+    if df is None or df.empty or len(df) < 2:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.index = pd.to_datetime(df.index)
+    trading_days = df.index[df.index >= pd.Timestamp(award_dt)]
+    if len(trading_days) == 0:
+        return None
+
+    entry_day  = trading_days[0]
+    entry_price = float(df.loc[entry_day, "Open"]) * (1 + SLIPPAGE_PCT)
+    if entry_price <= 0:
+        return None
+
+    peak_gain_pct = 0.0
+    trailing_stop = entry_price * (1 - gap_pct)
+    subsequent    = df.index[df.index > entry_day][:max_hold_days]
+
+    for day in subsequent:
+        row = df.loc[day]
+        high = float(row["High"])
+        low  = float(row["Low"])
+        if low <= trailing_stop:
+            return _ratchet_result(ticker, entry_day, entry_price,
+                                   day, trailing_stop, "trailing_stop",
+                                   gap_pct, peak_gain_pct)
+        day_gain = (high - entry_price) / entry_price
+        if day_gain > peak_gain_pct:
+            peak_gain_pct = day_gain
+            trailing_stop = entry_price * (1 + peak_gain_pct - gap_pct)
+
+    if len(subsequent) == 0:
+        return None
+    last_day    = subsequent[-1]
+    exit_price  = float(df.loc[last_day, "Close"])
+    return _ratchet_result(ticker, entry_day, entry_price,
+                           last_day, exit_price, "time_exit",
+                           gap_pct, peak_gain_pct)
+
+
+def _ratchet_result(ticker, entry_day, entry_price, exit_day, exit_price,
+                    reason, gap_pct, peak_gain_pct):
+    """Build result dict for ratchet simulation with slippage and commission."""
+    slipped_exit = exit_price * (1 - SLIPPAGE_PCT)
+    commission   = (entry_price + slipped_exit) * COMMISSION_PCT
+    pnl          = (slipped_exit - entry_price) - commission
+    pnl_pct      = pnl / entry_price * 100
+    entry_date_s = str(entry_day.date()) if hasattr(entry_day, "date") else str(entry_day)
+    exit_date_s  = str(exit_day.date())  if hasattr(exit_day,  "date") else str(exit_day)
+    return {
+        "ticker":       ticker,
+        "entry_date":   entry_date_s,
+        "entry_price":  round(entry_price,  4),
+        "exit_date":    exit_date_s,
+        "exit_price":   round(slipped_exit, 4),
+        "exit_reason":  reason,
+        "pnl_pct":      round(pnl_pct, 3),
+        "hit_stop":     reason == "trailing_stop",
+        "timed_out":    reason == "time_exit",
+        "gap_pct":      round(gap_pct * 100, 1),
+        "peak_pnl_pct": round(peak_gain_pct * 100, 3),
+    }
+
+
 def _result(ticker, entry_day, entry_price, exit_day, exit_price,
             reason, tp_pct, sl_pct):
     # Apply exit-side slippage (adverse fill) and round-trip commission
