@@ -23,13 +23,18 @@ rtk ls -la datasets/                 # 65% savings
 |------|---------|
 | `build_training_set.py` | 3-stage training dataset builder (checkpoint-resumable) |
 | `backtest.py` | Replay historical awards through filter → score → simulate |
-| `optimizer.py` | Grid-search over threshold/TP/SL/hold/max_mcap; expectancy-based ranking |
+| `optimizer.py` | Grid-search over threshold/TP/SL/hold/max_mcap; avg_pnl/week ranking |
 | `scoring_engine.py` | 5-factor scoring (value-to-mcap, sole-source, first-agency, hot-sector, no-PR) |
-| `filter_engine.py` | Live trading filter — 6 rejection criteria, thread-safe mcap cache |
-| `filter_engine_bt.py` | Backtest filter — uses pre-computed training CSV; accepts `max_market_cap` param |
-| `price_sim.py` | Trade simulator — applies 0.5% slippage + 0.1% commission per side |
-| `ticker_resolver_v4.py` | 5-tier resolver: CAGE → GLEIF → LEI → OpenFIGI → EDGAR |
-| `ticker_resolver_v3.py` | Shared EDGAR utilities imported by V4 and `main.py` — do not delete |
+| `filter_engine.py` | Live trading filter — rejection criteria, thread-safe mcap cache |
+| `filter_engine_bt.py` | Backtest filter — uses pre-computed training CSV; value-to-mcap ratio check |
+| `price_sim.py` | Trade simulator — enters at open_t1 (no look-ahead); 0.5% slippage + 0.1% commission |
+| `resolver/` | V1 resolver package — DuckDB-backed, bulk EDGAR enrichment, parallelized |
+| `cage_resolver.py` | CAGE code → GLEIF/LEI lookup |
+| `lei_resolver.py` | LEI → ticker via OpenFIGI/SEC mapping |
+| `sam_entity_client.py` | SAM.gov Entity API client (CAGE → canonical legal name) |
+| `enrich_ohlc.py` | Standalone OHLC enrichment for training rows |
+| `award_cache.py` | Award-level caching layer |
+| `build_issuer_master.py` | Build/refresh issuer master table from EDGAR |
 | `sam_poller.py` | SAM.gov polling — extracts cage_code; sole-source via `config.is_sole_source()` |
 | `edgar_client.py` | EDGAR submissions/8-K/dilutive filings — RateLimiter throttled |
 | `news_checker.py` | Google News RSS press-release check — RateLimiter throttled |
@@ -65,8 +70,8 @@ File: `FY{year}_All_Contracts_Full_YYYYMMDD.zip` → extract into `datasets/`
 |----------|-------|-------|
 | `MIN_CONTRACT_VALUE` | $1M | Stage 1 + live filter |
 | `MAX_MARKET_CAP` | $5B | Wide net — optimizer tunes the real cutoff |
-| `SCORE_THRESHOLD` | 40 | Minimum score to place a trade |
-| `MIN_TICKER_CONFIDENCE` | `"medium"` | Skips low/low_medium confidence resolutions |
+| `SCORE_THRESHOLD` | 30 | Minimum score to place a trade |
+| `MIN_TICKER_CONFIDENCE` | `"low"` | Accepts low+ confidence resolutions in backtest |
 | `SLIPPAGE_PCT` | 0.5% | Applied per side in price_sim.py |
 | `COMMISSION_PCT` | 0.1% | Applied per side in price_sim.py |
 
@@ -85,6 +90,9 @@ Two tests fail on a clean checkout (see `docs/FAILING_TESTS.md`):
 
 - USASpending API: requires User-Agent header; max page size 100 (422 on higher values)
 - EDGAR rate limit: 0.12 s/req (hard floor); submissions cached per CIK in-memory
-- `ticker_resolver_v3.py` is a shared utility module — V4 and main.py both import from it
+- Resolver V1 (`resolver/`) is the active resolver — DuckDB-backed, replaces TickerResolverV4
 - No Sharpe ratio anywhere in the codebase (removed — EDGAR date granularity made it meaningless)
 - 8-K timing stored as `days_to_8k` (integer days), not hours
+- `price_sim.py` enters at `open_t1` (day after award) — no look-ahead bias
+- Optimizer ranks by `avg_pnl_per_week` (N≥5); GUI uses same metric for consistency
+- `filter_engine_bt.py` Filter 3b: contract value-to-mcap must be 1%–500%

@@ -1,6 +1,6 @@
 # Optimizer Audit — `optimizer.py`
 
-_Audited: 2026-04-11_
+_Audited: 2026-04-11 | Updated: 2026-04-12 — marked items fixed in audit session_
 
 ---
 
@@ -53,13 +53,13 @@ USASpending CSV
 | `peak_pnl_pct` | Best single trade's final PnL (not MFE) |
 | `max_drawdown_pct` | Sequential drawdown on unsorted PnL stream — see Bug #4 |
 
-### `_rank_score()` — Selection Formula
+### `_rank_score()` — Selection Formula (updated 2026-04-12)
 
 ```python
-avg_pnl * sqrt(n)   # ≡ total_pnl_pct / sqrt(n)
+avg_pnl_per_week    # trades_per_week × avg_pnl_pct; requires N≥5
 ```
 
-Selects the combo with the best combination of per-trade quality and quantity. More trades help (via sqrt(n)) but with diminishing returns.
+Selects the combo that maximizes weekly return, requiring a minimum of 5 trades to qualify. GUI uses the same metric (`_rank_score_gui`). Old SQN formula (avg_pnl × √n, N≥15) was replaced.
 
 ---
 
@@ -75,13 +75,9 @@ Selects the combo with the best combination of per-trade quality and quantity. M
 
 ---
 
-### Bug 2 — `_rank_score` comment/label says "expectancy" but uses `avg_pnl`
+### Bug 2 — ~~`_rank_score` comment/label says "expectancy" but uses `avg_pnl`~~ ✅ FIXED 2026-04-12
 
-**File:** `optimizer.py:271–282`, `optimizer.py:376`
-
-The docstring says _"Rank by expectancy … Higher is better"_ but the code computes `avg_pnl * sqrt(n)`. Expectancy has a specific trading definition: `(win_rate × avg_win) - (loss_rate × avg_loss)`. `avg_pnl` approximates it but is not the same. In addition, `_print_top10` labels the winner as `"BEST COMBO (highest total % return)"` (line 376), which is wrong — the best combo is picked by `_rank_score`, not by sorting on `total_pnl_pct`. The top-10 table is sorted by total return, so the "best combo" can easily be absent from the displayed top 10.
-
-**Fix:** Either rename the variable to `rank_score` / `quality_score` in the comment, or use the pre-computed `stats["expectancy"]` consistently. Fix the print label to say _"BEST COMBO (highest rank score: avg_pnl × √trades)"_.
+**Fixed:** `_rank_score` now uses `avg_pnl_per_week` with N≥5 minimum. Print labels updated to "highest avg PnL/week". GUI `_rank_score_gui` synced to same formula.
 
 ---
 
@@ -132,11 +128,9 @@ Remove it.
 
 ## Architecture Issues
 
-### Issue A — Grid search has no minimum trade count filter
+### Issue A — ~~Grid search has no minimum trade count filter~~ ✅ FIXED 2026-04-12
 
-Combos with n=1 or n=2 trades can produce artificially high `total_pnl_pct` and can rank near the top of both the table and `_rank_score`. With `avg_pnl × sqrt(n)`, a single +15% trade scores 15.0, beating a combo with 20 trades at +3% avg (score = 13.4). Statistically, 1-trade combos are meaningless and pollute the top-10 display. 
-
-**Recommendation:** Add a minimum trade count (e.g. `n >= 10`) before including a combo in the ranked output or selecting best_combo. Keep all combos in the CSV for analysis.
+**Fixed:** `_rank_score` now returns -999 for N < 5 (was N < 15 for old SQN). Combos with fewer than 5 trades are excluded from best-combo selection.
 
 ---
 
@@ -160,11 +154,9 @@ The cache pre-filters at the config-level $5B cap. Per-combo mcap cutoffs then f
 
 ---
 
-### Issue D — Dual ranking systems (total return vs rank score) are inconsistent and confusing
+### Issue D — ~~Dual ranking systems (total return vs rank score) are inconsistent~~ ✅ FIXED 2026-04-12
 
-The top-10 table sorts by `total_pnl_pct` (raw sum), while `best_combo` is selected by `_rank_score` (avg × √n). These are measuring different things. A user reading the output will see the "best combo" may not appear in the top-10 table at all, with no explanation why. 
-
-**Recommendation:** Either pick one ranking system and use it consistently, or show two separate sections: "Top 10 by Total Return" and "Top 10 by Risk-Adjusted Score", with clear labeling.
+**Fixed:** `_print_top10` now sorts by `avg_pnl_per_week` (same as `_rank_score`). Best combo and top-10 table use the same metric. GUI `_rank_score_gui` synced.
 
 ---
 
@@ -198,19 +190,19 @@ The CSV is written in evaluation order (not sorted by any metric). Analysts load
 
 ## Summary Table
 
-| # | Severity | Type | Description |
-|---|---|---|---|
-| Bug 1 | High | Bug | `avg_return_t7` always 0 — metric is dead |
-| Bug 2 | Medium | Bug | `_rank_score` mislabeled as "expectancy"; best_combo labeled as "highest total return" |
-| Bug 3 | High | Performance | Score re-computed per combo instead of per row (O(n×combos) vs O(n)) |
-| Bug 4 | Medium | Bug | Max drawdown computed on unsorted stream — unreliable |
-| Bug 5 | Low | Bug | Cache mode silently zeroes peak/t7 metrics |
-| Bug 6 | Low | Bug | Dead `import tempfile` in `optimize_from_api` |
-| Issue A | Medium | Architecture | No minimum trade count filter — 1-trade combos pollute results |
-| Issue B | — | (same as Bug 3) | — |
-| Issue C | Medium | Architecture | Pre-filter ceiling tied to `config.MAX_MARKET_CAP` instead of grid max |
-| Issue D | Medium | Architecture | Two inconsistent ranking systems with no explanation |
-| Issue E | Low | Architecture | No checkpointing — full restart on crash |
-| Issue F | Low | Architecture | `normalize_date` duplicated in two files |
-| Issue G | High | Performance | yfinance re-downloaded per combo in cache mode |
-| Issue H | Low | UX | `optimizer_results.csv` written unsorted |
+| # | Severity | Type | Status | Description |
+|---|---|---|---|---|
+| Bug 1 | High | Bug | **Open** | `avg_return_t7` always 0 — metric is dead |
+| Bug 2 | Medium | Bug | ✅ Fixed | `_rank_score` mislabeled — now uses `avg_pnl_per_week` |
+| Bug 3 | High | Performance | **Open** | Score re-computed per combo instead of per row (O(n×combos) vs O(n)) |
+| Bug 4 | Medium | Bug | **Open** | Max drawdown computed on unsorted stream — unreliable |
+| Bug 5 | Low | Bug | **Open** | Cache mode silently zeroes peak/t7 metrics |
+| Bug 6 | Low | Bug | **Open** | Dead `import tempfile` in `optimize_from_api` |
+| Issue A | Medium | Architecture | ✅ Fixed | Min trade count — N≥5 now required for ranking |
+| Issue B | — | (same as Bug 3) | **Open** | — |
+| Issue C | Medium | Architecture | **Open** | Pre-filter ceiling tied to `config.MAX_MARKET_CAP` instead of grid max |
+| Issue D | Medium | Architecture | ✅ Fixed | Dual ranking systems consolidated to `avg_pnl_per_week` |
+| Issue E | Low | Architecture | **Open** | No checkpointing — full restart on crash |
+| Issue F | Low | Architecture | **Open** | `normalize_date` duplicated in two files |
+| Issue G | High | Performance | **Open** | yfinance re-downloaded per combo in cache mode |
+| Issue H | Low | UX | **Open** | `optimizer_results.csv` written unsorted |
