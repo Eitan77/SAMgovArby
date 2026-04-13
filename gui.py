@@ -326,14 +326,21 @@ class NumericSortProxyModel(QSortFilterProxyModel):
             return str(l_data).lower() < str(r_data).lower()
 
 
-def _load_csv(path: Path) -> tuple[list[str], list[dict]]:
+def _load_csv(path: Path, max_rows: int = 0) -> tuple[list[str], list[dict]]:
     if not path.exists():
         return [], []
     try:
-        with open(path, newline="", encoding="utf-8") as f:
+        with open(path, newline="", encoding="utf-8", errors="replace") as f:
             reader = csv.DictReader(f)
-            rows = list(reader)
             headers = list(reader.fieldnames or [])
+            if max_rows > 0:
+                rows = []
+                for row in reader:
+                    rows.append(row)
+                    if len(rows) >= max_rows:
+                        break
+            else:
+                rows = list(reader)
         return headers, rows
     except Exception:
         return [], []
@@ -349,8 +356,13 @@ def _file_stat(path: Path) -> str:
         size_str = f"{size/1_000:.1f} KB"
     else:
         size_str = f"{size} B"
-    _, rows = _load_csv(path)
-    row_str = f"{len(rows):,} rows" if rows else "0 rows"
+    # Fast row count via byte scan (no CSV parsing)
+    try:
+        with open(path, "rb") as f:
+            row_count = max(0, sum(1 for _ in f) - 1)  # subtract header
+        row_str = f"{row_count:,} rows"
+    except Exception:
+        row_str = "? rows"
     import datetime
     mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
     return f"{row_str} · {size_str} · {mtime}"
@@ -423,7 +435,7 @@ class MPLCanvas(FigureCanvasQTAgg):
             ax.set_xlabel("Trade #", color="#cdd6f4")
             ax.set_ylabel("Cumulative P&L %", color="#cdd6f4")
         ax.set_title(title, color="#89b4fa")
-        self.draw()
+        self.draw_idle()
 
     def clear_plot(self):
         self.fig.clear()
@@ -432,7 +444,7 @@ class MPLCanvas(FigureCanvasQTAgg):
         for spine in ax.spines.values():
             spine.set_edgecolor("#45475a")
         ax.set_title("No data", color="#585b70")
-        self.draw()
+        self.draw_idle()
 
 
 # ─── ProcessManager ───────────────────────────────────────────────────────────
@@ -940,8 +952,11 @@ class TradesDialog(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
 
-        # Load CSV data
-        headers, all_rows = _load_csv(path)
+        # Load CSV data — cap at 50k rows to avoid blocking on huge files
+        MAX_ROWS = 50_000
+        size = path.stat().st_size if path.exists() else 0
+        headers, all_rows = _load_csv(path, max_rows=MAX_ROWS)
+        truncated = size > 0 and len(all_rows) >= MAX_ROWS
 
         # Create tabs
         tabs = QTabWidget()
@@ -976,6 +991,10 @@ class TradesDialog(QWidget):
         os.unlink(temp_path)
         tabs.addTab(all_view, f"📋 All Rows ({len(all_rows)})")
 
+        if truncated:
+            warn = QLabel(f"⚠  Showing first {MAX_ROWS:,} rows of {size/1_000_000:.0f} MB file — open CSV directly for full data.")
+            warn.setStyleSheet("color: #f9e2af; font-size: 11px; padding: 4px;")
+            lay.addWidget(warn)
         lay.addWidget(tabs)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
@@ -1139,7 +1158,7 @@ class BacktestTab(QWidget):
 
     def _load_optimizer_params(self):
         """Fill params from top row of optimizer_results.csv."""
-        headers, rows = _load_csv(OUTPUT_FILES["optimizer"])
+        headers, rows = _load_csv(OUTPUT_FILES["optimizer"], max_rows=2000)
         if not rows:
             return
         # Sort by avg_pnl_per_week descending to get best row
@@ -1158,6 +1177,8 @@ class BacktestTab(QWidget):
         except Exception as e: log.warning(f"Non-critical error setting threshold value: {e}")
 
     def _run_backtest(self):
+        if PROC.is_running("backtest"):
+            return
         ds = DATASET_CONFIGS[self._dataset_combo.currentText()]
         training_csv = str(ds["stage3"])
         args = [
@@ -1284,11 +1305,7 @@ class BacktestTab(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         if breakdown:
-            bd_box = self._display_breakdown(breakdown)
-            for i in range(bd_box.layout().count()):
-                item = bd_box.layout().takeAt(0)
-                if item:
-                    self._breakdown_lay.addLayout(item) if isinstance(item, QHBoxLayout) else self._breakdown_lay.addWidget(item.widget())
+            self._breakdown_lay.addWidget(self._display_breakdown(breakdown))
         else:
             ph = QLabel("Run backtest...")
             ph.setStyleSheet("color: #585b70;")
@@ -1573,12 +1590,13 @@ class OptimizerTab(QWidget):
     def _load_results(self):
         # optimizer.py writes to optimizer_results.csv (not year-specific)
         path = SCRIPTS_DIR / "optimizer_results.csv"
-        headers, rows = _load_csv(path)
+        # File is pre-sorted best-first by optimizer; read top 2000 only to avoid blocking on large files
+        headers, rows = _load_csv(path, max_rows=2000)
         if not rows:
             WATCHER.refresh_watch(path)
             return
 
-        # Sort by SQN descending (best first)
+        # Sort by rank score descending (best first)
         try:
             rows.sort(key=lambda r: _rank_score_gui(r), reverse=True)
         except Exception:
@@ -1688,7 +1706,7 @@ class TrainingDataTab(QWidget):
         super().__init__(parent)
         self._build_ui()
         self._setup_watchers()
-        self._refresh_status()
+        QTimer.singleShot(600, self._refresh_status)
 
     def _ds(self) -> dict:
         """Return the currently selected dataset config dict."""
