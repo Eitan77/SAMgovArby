@@ -1000,6 +1000,7 @@ class BacktestTab(QWidget):
         self._hold.setValue(hold)
         self._threshold.setValue(threshold)
         self._on_mode_change(1)
+        # Dead zone is already written to config.py by the optimizer — no GUI action needed
 
     def _build_ui(self):
         root = QHBoxLayout(self)
@@ -1036,7 +1037,7 @@ class BacktestTab(QWidget):
         pf.setSpacing(6)
 
         self._tp = QDoubleSpinBox()
-        self._tp.setRange(0.01, 0.25); self._tp.setSingleStep(0.01); self._tp.setValue(0.04)
+        self._tp.setRange(0.01, 0.30); self._tp.setSingleStep(0.01); self._tp.setValue(0.04)
         self._tp.setDecimals(2); self._tp.setSuffix("  (4%)")
         self._tp.valueChanged.connect(lambda v: self._tp.setSuffix(f"  ({v*100:.0f}%)"))
 
@@ -1046,7 +1047,7 @@ class BacktestTab(QWidget):
         self._sl.valueChanged.connect(lambda v: self._sl.setSuffix(f"  ({v*100:.1f}%)"))
 
         self._hold = QSpinBox()
-        self._hold.setRange(1, 5); self._hold.setValue(3); self._hold.setSuffix(" days")
+        self._hold.setRange(1, 10); self._hold.setValue(3); self._hold.setSuffix(" days")
 
         self._threshold = QSpinBox()
         self._threshold.setRange(0, 100); self._threshold.setValue(40)
@@ -1658,6 +1659,13 @@ class OptimizerTab(QWidget):
             hold = int(float(b.get("max_hold_days", 3)))
             thr  = int(float(b.get("score_threshold", 40)))
             self.apply_params.emit(tp, sl, hold, thr)
+            dz_min = float(b.get("dz_min_pct", 0))
+            dz_max = float(b.get("dz_max_pct", 0))
+            if dz_min < dz_max:
+                import logging as _log
+                _log.getLogger("gui").info(
+                    f"Best combo dead zone: {dz_min:.1f}%–{dz_max:.1f}% (written to config.py by optimizer)"
+                )
         except Exception:
             pass
 

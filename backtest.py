@@ -16,7 +16,8 @@ from config_logging import setup_logging, add_verbosity_flags
 from filter_engine_bt import apply_filters_bt_from_training
 from scoring_engine import score_contract
 from price_sim import simulate_asymmetric_from_row
-from config import SCORE_THRESHOLD, TP_PCT, SL_PCT, MAX_HOLD_DAYS
+from config import (SCORE_THRESHOLD, TP_PCT, SL_PCT, MAX_HOLD_DAYS,
+                    TRAILING_STOP_ACTIVATE_PCT, TRAILING_STOP_GAP_PCT)
 
 log = logging.getLogger("backtest")
 
@@ -63,6 +64,9 @@ def _build_funnel_breakdown(all_results, training_csv=None):
         "backtest_no_ticker": 0,
         "backtest_no_price": 0,
         "backtest_duplicate": 0,
+        "backtest_split_contract": 0,
+        "backtest_pharma_naics": 0,
+        "backtest_largecap_low_v2m": 0,
         "traded": 0,
     }
 
@@ -122,6 +126,8 @@ def _build_funnel_breakdown(all_results, training_csv=None):
             breakdown["backtest_no_price"] += 1
         elif fr == "duplicate":
             breakdown["backtest_duplicate"] += 1
+        elif fr == "split_contract":
+            breakdown["backtest_split_contract"] += 1
         elif fr == "fail":
             if re.search(r"ticker confidence.*below", reason, re.I):
                 breakdown["backtest_low_confidence"] += 1
@@ -131,6 +137,10 @@ def _build_funnel_breakdown(all_results, training_csv=None):
                 breakdown["backtest_no_mcap"] += 1
             elif re.search(r"of mcap (below|above)", reason, re.I):
                 breakdown["backtest_value_to_mcap"] += 1
+            elif re.search(r"Large-cap.*immaterial", reason, re.I):
+                breakdown["backtest_largecap_low_v2m"] += 1
+            elif re.search(r"pharma", reason, re.I):
+                breakdown["backtest_pharma_naics"] += 1
             elif re.search(r"8-K filed", reason, re.I):
                 breakdown["backtest_8k"] += 1
             elif re.search(r"dilutive", reason, re.I):
@@ -149,10 +159,11 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
                  tp: float = TP_PCT, sl: float = SL_PCT,
                  hold: int = MAX_HOLD_DAYS, threshold: int = SCORE_THRESHOLD,
                  output_file: str = RESULTS_FILE,
-                 training_csv: str = None):
+                 training_csv: str = None, max_mcap: float = None):
     """Run a backtest from the pre-built training CSV. Returns (stats, breakdown, all_results).
 
     training_csv: path to training_set_final.csv from build_training_set.py (required).
+    max_mcap: optional additional market cap ceiling (on top of config MAX_MARKET_CAP).
     """
     if not training_csv:
         raise ValueError(
@@ -161,16 +172,17 @@ def run_backtest(start_date: str, end_date: str, max_records: int = 5000,
         )
 
     log.info(f"Backtest: {start_date} -> {end_date} | "
-             f"TP={tp*100:.1f}% SL={sl*100:.1f}% Hold={hold}d Threshold={threshold}")
+             f"TP={tp*100:.1f}% SL={sl*100:.1f}% Hold={hold}d Threshold={threshold}"
+             + (f" MaxMcap=${max_mcap/1e6:.0f}M" if max_mcap else ""))
 
     return _run_backtest_from_training(
         training_csv, start_date, end_date, max_records,
-        tp, sl, hold, threshold, output_file
+        tp, sl, hold, threshold, output_file, max_mcap
     )
 
 
 def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
-                                tp, sl, hold, threshold, output_file):
+                                tp, sl, hold, threshold, output_file, max_mcap=None):
     """Run backtest using pre-built training CSV with historical signals."""
     import csv as _csv
 
@@ -199,6 +211,24 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     rows = [r for r in rows if start_date <= normalize_date(r.get("posted_date", "")) <= end_date]
     log.info(f"{len(rows)} rows within date range {start_date} -> {end_date}")
 
+    # Pre-compute split-contract keys: (agency, award_amount, date) tuples where 2+
+    # different tickers received the same award simultaneously. These are routine contract
+    # renewals split across multiple awardees — the market doesn't react.
+    from collections import defaultdict
+    _split_key_tickers: dict = defaultdict(set)
+    for _r in rows[:max_records]:
+        _ticker = (_r.get("ticker") or "").strip()
+        _norm_date = normalize_date(_r.get("posted_date", ""))
+        _amt = _r.get("award_amount", "0")
+        if _ticker:
+            _key = (_r.get("agency", "").strip(), _amt, _norm_date)
+            _split_key_tickers[_key].add(_ticker)
+    # Require 3+ different tickers to flag as a split contract — avoids false positives
+    # on standard 2-vendor competitive awards; targets large multi-carrier batches like USTRANSCOM
+    split_contract_keys: set = {k for k, tickers in _split_key_tickers.items() if len(tickers) >= 3}
+    if split_contract_keys:
+        log.info(f"Split-contract filter: {len(split_contract_keys)} award batches with 2+ tickers will be rejected")
+
     all_results = []
     total_to_process = min(len(rows), max_records)
     signals = 0
@@ -209,7 +239,21 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
 
     log.info(f"Processing {total_to_process} awards from training data...")
     for i, row in enumerate(rows[:max_records]):
-        result = _process_training_row(row, tp, sl, hold, threshold)
+        result = _process_training_row(row, tp, sl, hold, threshold, max_mcap)
+
+        # Filter A: split-contract rejection (must check before dedup/trade tracking)
+        if result.get("filter_result") == "pass":
+            _sc_key = (
+                row.get("agency", "").strip(),
+                row.get("award_amount", "0"),
+                normalize_date(row.get("posted_date", "")),
+            )
+            if _sc_key in split_contract_keys:
+                result["filter_result"] = "split_contract"
+                result["filter_reason"] = "Split contract: same award_amount/agency/date awarded to 3+ tickers simultaneously"
+                for _fld in ("entry_price", "exit_price", "pnl_pct", "entry_date",
+                             "exit_date", "exit_reason", "hit_tp", "hit_sl", "timed_out"):
+                    result.pop(_fld, None)
 
         # Deduplicate: (1) no two trades for same ticker on same day,
         # (2) no new trade if a prior position in that ticker is still within hold window.
@@ -278,7 +322,7 @@ def _run_backtest_from_training(csv_path, start_date, end_date, max_records,
     return stats, breakdown, all_results
 
 
-def _process_training_row(row, tp, sl, hold, threshold):
+def _process_training_row(row, tp, sl, hold, threshold, max_mcap=None):
     """Process one row from the training CSV through filter -> score -> simulate."""
     sole_source = row.get("sole_source", "")
     if isinstance(sole_source, str):
@@ -309,6 +353,13 @@ def _process_training_row(row, tp, sl, hold, threshold):
 
     # Score using historical market cap and actual press release signal
     market_cap = extra.get("market_cap", 0)
+
+    # Optional additional market cap ceiling from optimizer
+    if max_mcap is not None and market_cap > max_mcap:
+        base["filter_result"] = "fail"
+        base["filter_reason"] = f"Market cap ${market_cap:,.0f} exceeds optimizer max ${max_mcap:,.0f}"
+        return base
+
     has_pr = extra.get("has_press_release", False)
 
     # Parse agency_prior_win_count from training CSV (0 = first win)
@@ -418,6 +469,7 @@ def _print_report(stats, all_results, traded, start_date, end_date):
     no_ticker = sum(1 for r in all_results if r.get("filter_result") == "no_ticker")
     no_price = sum(1 for r in all_results if r.get("filter_result") == "no_price_data")
     duplicates = sum(1 for r in all_results if r.get("filter_result") == "duplicate")
+    split_contracts = sum(1 for r in all_results if r.get("filter_result") == "split_contract")
 
     print("\n" + "=" * 60)
     print(f"  BACKTEST RESULTS  {start_date} -> {end_date}")
@@ -429,6 +481,7 @@ def _print_report(stats, all_results, traded, start_date, end_date):
     print(f"    +--- No ticker         : {no_ticker:,}")
     print(f"    +--- No price data     : {no_price:,}")
     print(f"    +--- Duplicate ticker  : {duplicates:,}")
+    print(f"    +--- Split contract    : {split_contracts:,}")
     print(f"  Trades simulated       : {stats.get('trades', 0):,}")
     print("-" * 60)
     if stats.get("trades", 0) > 0:
@@ -514,6 +567,8 @@ if __name__ == "__main__":
                         help="Stop loss fraction EOD close (e.g. 0.025 for 2.5%%)")
     parser.add_argument("--hold", type=int, default=MAX_HOLD_DAYS, help="Max hold days")
     parser.add_argument("--threshold", type=int, default=SCORE_THRESHOLD, help="Score threshold")
+    parser.add_argument("--max-mcap", type=float, default=None,
+                        help="Max historical market cap (e.g. 500e6 for $500M)")
     parser.add_argument("--watchlist", action="store_true", help="Use watchlist mode (known small-cap defense stocks)")
     parser.add_argument("--dataset", type=str, default=None, help="Path to pre-built dataset JSON from bulk_builder.py")
     parser.add_argument("--training-csv", type=str, default=None,
@@ -533,4 +588,5 @@ if __name__ == "__main__":
         threshold=args.threshold,
         training_csv=args.training_csv,
         output_file=RESULTS_FILE,
+        max_mcap=args.max_mcap,
     )

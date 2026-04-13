@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from config import (MIN_CONTRACT_VALUE, MAX_MARKET_CAP,
                     MIN_VALUE_TO_MCAP_PCT, MAX_VALUE_TO_MCAP_PCT,
+                    V2M_DEAD_ZONE_MIN, V2M_DEAD_ZONE_MAX,
                     MAX_8K_WINDOW_DAYS, MAX_DILUTIVE_WINDOW_DAYS,
                     MAX_PR_WINDOW_DAYS, MIN_TICKER_CONFIDENCE)
 
@@ -43,7 +44,7 @@ def _days_signed(earlier_str, later_str) -> int | None:
         return None
 
 
-def apply_filters_bt_from_training(row):
+def apply_filters_bt_from_training(row, skip_dead_zone=False):
     """Filter using pre-computed historical data from the training CSV.
 
     Uses date-based columns for tunable window filtering.
@@ -55,6 +56,12 @@ def apply_filters_bt_from_training(row):
     award_amount = float(row.get("award_amount", 0))
     if award_amount < MIN_CONTRACT_VALUE:
         return False, f"Contract ${award_amount:,.0f} below minimum", extra
+
+    # Filter 1b: Exclude pharmaceutical preparations (NAICS 325411/325412) — pure drug
+    # supply contracts have no stock momentum; prices are trial-data driven, not procurement.
+    naics = str(row.get("naics", "")).strip()
+    if naics.startswith("325412") or naics.startswith("325411"):
+        return False, f"NAICS {naics} (pharmaceutical preparations) excluded", extra
 
     # Filter 2: Ticker confidence check
     confidence = row.get("ticker_confidence", "none")
@@ -86,6 +93,19 @@ def apply_filters_bt_from_training(row):
         return False, f"Contract {value_to_mcap*100:.2f}% of mcap below {MIN_VALUE_TO_MCAP_PCT*100:.0f}% minimum (too immaterial)", extra
     if value_to_mcap > MAX_VALUE_TO_MCAP_PCT:
         return False, f"Contract {value_to_mcap*100:.2f}% of mcap above {MAX_VALUE_TO_MCAP_PCT*100:.0f}% maximum (distress signal)", extra
+
+    # Store V2M for optimizer dead zone sweep (needed even when dead zone is skipped)
+    extra["value_to_mcap"] = value_to_mcap
+
+    # Filter 3d: V2M dead zone — empirically low win rates in this range.
+    # skip_dead_zone=True is used by optimizer to sweep this boundary as a parameter.
+    if not skip_dead_zone and V2M_DEAD_ZONE_MIN < V2M_DEAD_ZONE_MAX and V2M_DEAD_ZONE_MIN <= value_to_mcap <= V2M_DEAD_ZONE_MAX:
+        return False, f"V2M {value_to_mcap*100:.1f}% in dead zone ({V2M_DEAD_ZONE_MIN*100:.0f}%-{V2M_DEAD_ZONE_MAX*100:.0f}%) — historically low win rate", extra
+
+    # Filter 3c: Large-cap + immaterial contract — contract is noise for a large company
+    # A $2B+ company with V2M < 5% sees no stock movement from the contract
+    if hist_mcap > 2_000_000_000 and value_to_mcap < 0.05:
+        return False, f"Large-cap (${hist_mcap/1e9:.1f}B mcap) with immaterial contract ({value_to_mcap*100:.1f}% V2M < 5%)", extra
 
     # Filter 4: 8-K check — reject if 8-K filed ON OR AFTER award within window
     award_date = row.get("posted_date", "")

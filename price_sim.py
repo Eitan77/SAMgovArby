@@ -291,7 +291,9 @@ def simulate_trade_from_row(row: dict, take_profit_pct: float,
     return r
 
 
-def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_hold_days: int):
+def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_hold_days: int,
+                                 trailing_activate_pct: float = None,
+                                 trailing_gap_pct: float = None):
     """Asymmetric exit simulation: TP on intraday high, SL on EOD close.
 
     Entry: open_t1 with slippage (day AFTER award date — avoids look-ahead bias).
@@ -363,11 +365,21 @@ def simulate_asymmetric_from_row(row: dict, tp_pct: float, sl_pct: float, max_ho
             r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
             return r
 
+        # Effective SL: trailing stop (if armed) overrides fixed SL once it's higher
+        effective_sl = sl_price
+        effective_reason = "stop_loss"
+        if trailing_activate_pct is not None and trailing_gap_pct is not None:
+            peak_gain = (peak_high - entry_price) / entry_price
+            if peak_gain >= trailing_activate_pct:
+                trailing_sl = peak_high * (1 - trailing_gap_pct)
+                if trailing_sl > effective_sl:
+                    effective_sl = trailing_sl
+                    effective_reason = "trailing_stop"
+
         # SL checked on EOD close only — avoids intraday noise stop-outs
-        # Exit at sl_price (not close) so losses are capped at the stop level
-        if close <= sl_price:
+        if close <= effective_sl:
             r = _result(ticker, entry_date, entry_price,
-                        exit_date, sl_price, "stop_loss", tp_pct, sl_pct)
+                        exit_date, effective_sl, effective_reason, tp_pct, sl_pct)
             r["peak_pnl_pct"] = round((peak_high - entry_price) / entry_price * 100, 3)
             return r
 

@@ -1,6 +1,7 @@
 """Step 3: Score filtered contracts on a 0-100 scale."""
 import logging
-from config import HOT_SECTOR_NAICS, GENERAL_DEFENSE_NAICS_PREFIX, SCORE_THRESHOLD, SCORE_WEIGHTS
+import math
+from config import HOT_SECTOR_NAICS, GENERAL_DEFENSE_NAICS_PREFIX, SCORE_THRESHOLD, SCORE_WEIGHTS, V2M_SCORE_FULL_CREDIT_RATIO
 
 log = logging.getLogger(__name__)
 
@@ -21,21 +22,16 @@ def score_contract(contract, market_cap, agency_history=None, threshold=None,
     w = SCORE_WEIGHTS
 
     # Factor 1: Contract value as % of market cap (max w["value_to_mcap"] pts)
+    # Continuous sqrt curve: full credit at V2M >= V2M_SCORE_FULL_CREDIT_RATIO (50%).
+    # Gives meaningful score gradient inside the old flat 5-10% tier so the optimizer
+    # can tune a threshold that naturally separates immaterial from material contracts.
     award_amount = float(contract["award_amount"])  # cast: may be str from CSV
     market_cap = float(market_cap)
     if market_cap > 0:
         ratio = award_amount / market_cap
         max_pts = w["value_to_mcap"]
-        if ratio >= 0.10:
-            pts = max_pts
-        elif ratio >= 0.05:
-            pts = int(max_pts * 0.67)   # 20 of 30
-        elif ratio >= 0.02:
-            pts = int(max_pts * 0.40)   # 12 of 30
-        elif ratio >= 0.01:
-            pts = int(max_pts * 0.20)   # 6 of 30
-        else:
-            pts = int(max_pts * 0.07)   # 2 of 30
+        capped_ratio = min(ratio, V2M_SCORE_FULL_CREDIT_RATIO)
+        pts = max(0, int(max_pts * math.sqrt(capped_ratio / V2M_SCORE_FULL_CREDIT_RATIO)))
     else:
         pts = 0
         ratio = 0

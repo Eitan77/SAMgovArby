@@ -45,12 +45,25 @@ OPT_RESULTS_FILE = os.path.join(os.path.dirname(__file__), "optimizer_results.cs
 # Market cap is swept separately inside Phase 2 at MCAP_STEP resolution (not in cartesian product)
 PARAM_GRID = {
     "score_threshold": list(range(1, 71)),               # 1–70 in 1-point steps
-    "tp_pct":          [i / 100 for i in range(2, 16)], # 2%–15% take profit
+    "tp_pct":          [i / 100 for i in range(2, 22)], # 2%–21% take profit
     "sl_pct":          [i / 100 for i in range(1, 9)],  # 1%–8% stop loss
     "max_hold_days":   [1, 2, 3, 4, 5, 6],              # days before time exit (T1 entry → max T7)
 }
 MCAP_STEP = 10_000_000          # 10M resolution for market cap sweep
 MCAP_MAX  = 5_000_000_000       # upper bound (matches global MAX_MARKET_CAP)
+
+# Dead zone sweep: (min_ratio, max_ratio) pairs to test.
+# (0.0, 0.0) = no dead zone. Each pair is tested across all threshold/tp/sl/hold combos.
+DEAD_ZONE_CONFIGS = [
+    (0.0,  0.0),    # no dead zone
+    (0.04, 0.10),
+    (0.05, 0.10),
+    (0.06, 0.10),   # current default
+    (0.05, 0.12),
+    (0.06, 0.12),
+    (0.05, 0.15),
+    (0.06, 0.15),
+]
 
 
 def optimize_from_cache(cache_file: str):
@@ -148,10 +161,34 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
         log.error("No rows with OHLC data. Run: enrich_ohlc.py datasets/training_set_final.csv")
         return None
 
-    # Pre-compute filter results once per row (filters are combo-independent)
+    # Pre-compute split contract keys: same (agency, award_amount, date) → 3+ different tickers
+    # Mirrors the same logic in backtest.py so the optimizer trains on the same universe.
+    from collections import defaultdict
+    _split_key_tickers: dict = defaultdict(set)
+    for _r in rows:
+        _ticker = (_r.get("ticker") or "").strip()
+        _norm_date = normalize_date(_r.get("posted_date", ""))
+        _amt = _r.get("award_amount", "0")
+        if _ticker:
+            _key = (_r.get("agency", "").strip(), _amt, _norm_date)
+            _split_key_tickers[_key].add(_ticker)
+    split_contract_keys: set = {k for k, tickers in _split_key_tickers.items() if len(tickers) >= 3}
+    if split_contract_keys:
+        log.info(f"Split-contract filter: {len(split_contract_keys)} award batches flagged")
+
+    # Pre-compute filter results once per row (skip dead zone — it's swept as a parameter)
     row_filter_cache = []
     for row in rows:
-        passed, _, extra = apply_filters_bt_from_training(row)
+        passed, _, extra = apply_filters_bt_from_training(row, skip_dead_zone=True)
+        # Also apply split contract filter (cross-row, pre-computed above)
+        if passed and split_contract_keys:
+            _sc_key = (
+                row.get("agency", "").strip(),
+                row.get("award_amount", "0"),
+                normalize_date(row.get("posted_date", "")),
+            )
+            if _sc_key in split_contract_keys:
+                passed = False
         row_filter_cache.append((passed, extra))
 
     # Pre-compute raw score once per row (threshold comparison happens per combo)
@@ -178,6 +215,22 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
                                       threshold=0, has_press_release=has_pr,
                                       is_first_agency_win=is_first_agency)
         row_score_cache.append((raw_score, extra, row))
+
+    # Pre-compute which row indices fall in each dead zone config (for fast exclusion in sweep)
+    dz_excluded: dict = {}
+    for dz_min, dz_max in DEAD_ZONE_CONFIGS:
+        if dz_min >= dz_max:  # (0,0) = no dead zone
+            dz_excluded[(dz_min, dz_max)] = set()
+        else:
+            excl = set()
+            for i, cached in enumerate(row_filter_cache):
+                if not cached[0]:  # already filtered
+                    continue
+                v2m = cached[1].get("value_to_mcap", 0)
+                if dz_min <= v2m <= dz_max:
+                    excl.add(i)
+            dz_excluded[(dz_min, dz_max)] = excl
+        log.debug(f"Dead zone ({dz_min*100:.0f}%-{dz_max*100:.0f}%): {len(dz_excluded[(dz_min, dz_max)])} rows excluded")
 
     # Compute date range for trades_per_week / avg_pnl_per_week
     all_dates = [normalize_date(r.get("posted_date", "")) for r in rows]
@@ -222,7 +275,7 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
 
     log.info("Simulation pre-computation complete. Running combo sweep...")
 
-    # ── Phase 2: sweep all (threshold, tp, sl, hold) combos ──
+    # ── Phase 2: sweep all (threshold, tp, sl, hold) combos × dead zone configs ──
     # For each combo, market cap is swept by sorting eligible trades by mcap and
     # walking through them cumulatively at MCAP_STEP resolution.  This is O(rows log rows)
     # per combo instead of O(rows × mcap_steps) — same result, ~500x faster.
@@ -232,102 +285,102 @@ def optimize_from_training_csv(csv_path: str, start_date: str = None, end_date: 
         PARAM_GRID["sl_pct"],
         PARAM_GRID["max_hold_days"],
     ))
-    n_mcap_steps = MCAP_MAX // MCAP_STEP
-    log.info(f"Testing {len(base_combos):,} combos × up to {n_mcap_steps} mcap steps "
-             f"(sorted-walk, not cartesian)")
+    n_dz = len(DEAD_ZONE_CONFIGS)
+    log.info(f"Testing {len(base_combos):,} combos × {n_dz} dead zone configs × mcap steps")
 
     best_score = -999
     best_combo = None
     opt_rows = []
+    total_combos = len(base_combos) * n_dz
+    processed = 0
 
-    for combo_idx, (threshold, tp, sl, hold) in enumerate(base_combos):
-        sim_results = sim_cache[(tp, sl, hold)]
+    for dz_min, dz_max in DEAD_ZONE_CONFIGS:
+        excluded = dz_excluded[(dz_min, dz_max)]
 
-        # Collect eligible trades with their market caps (one pass)
-        # Dedup: same (ticker, date) AND overlapping hold-window positions
-        eligible = []   # list of (mcap, pnl, peak)
-        seen_trades: set = set()
-        ticker_last_entry_opt: dict = {}
-        for row_idx, cached in enumerate(row_score_cache):
-            if cached is None:
-                continue
-            raw_score, extra, row = cached
-            if raw_score < threshold:
-                continue
-            ticker   = row.get("ticker", "")
-            date_str = normalize_date(row.get("posted_date", ""))[:10]
-            key = (ticker, date_str)
-            if key in seen_trades:
-                continue
-            # Skip if a prior position in the same ticker is still within hold window
-            if ticker and ticker in ticker_last_entry_opt:
-                try:
-                    from datetime import date as _date
-                    delta = (_date.fromisoformat(date_str) - _date.fromisoformat(ticker_last_entry_opt[ticker])).days
-                    if 0 < delta <= hold:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            seen_trades.add(key)
-            if ticker:
-                ticker_last_entry_opt[ticker] = date_str
-            sim_result = sim_results[row_idx]
-            if sim_result:
-                eligible.append((extra.get("market_cap", 0), sim_result[0], sim_result[1]))
+        for combo_idx, (threshold, tp, sl, hold) in enumerate(base_combos):
+            sim_results = sim_cache[(tp, sl, hold)]
 
-        if not eligible:
-            stats = _stats([], tp, sl, threshold, hold, MCAP_MAX, date_range_days)
-            opt_rows.append(stats)
-            continue
+            # Collect eligible trades (excluding dead zone rows for this config)
+            eligible = []
+            seen_trades: set = set()
+            ticker_last_entry_opt: dict = {}
+            for row_idx, cached in enumerate(row_score_cache):
+                if cached is None:
+                    continue
+                if row_idx in excluded:
+                    continue
+                raw_score, extra, row = cached
+                if raw_score < threshold:
+                    continue
+                ticker   = row.get("ticker", "")
+                date_str = normalize_date(row.get("posted_date", ""))[:10]
+                key = (ticker, date_str)
+                if key in seen_trades:
+                    continue
+                if ticker and ticker in ticker_last_entry_opt:
+                    try:
+                        from datetime import date as _date
+                        delta = (_date.fromisoformat(date_str) - _date.fromisoformat(ticker_last_entry_opt[ticker])).days
+                        if 0 < delta <= hold:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                seen_trades.add(key)
+                if ticker:
+                    ticker_last_entry_opt[ticker] = date_str
+                sim_result = sim_results[row_idx]
+                if sim_result:
+                    eligible.append((extra.get("market_cap", 0), sim_result[0], sim_result[1]))
 
-        # Sort by market cap ascending — enables single cumulative walk
-        eligible.sort()
-
-        # Walk through trades, emitting stats at each 10M boundary where trades change
-        ei = 0          # index into eligible
-        n_el = len(eligible)
-        pnls: list  = []
-        peaks: list = []
-        last_emitted_ei = -1  # track whether trade set changed since last emit
-
-        # Build list of mcap thresholds to evaluate: each unique 10M bucket that
-        # contains at least one trade, plus MCAP_MAX as the final bucket
-        buckets = set()
-        for mcap, _, _ in eligible:
-            buckets.add(((int(mcap) // MCAP_STEP) + 1) * MCAP_STEP)
-        buckets.add(MCAP_MAX)
-        mcap_thresholds = sorted(b for b in buckets if b <= MCAP_MAX)
-
-        for max_mcap in mcap_thresholds:
-            # Add all trades whose mcap falls within this threshold
-            while ei < n_el and eligible[ei][0] <= max_mcap:
-                pnls.append(eligible[ei][1])
-                peaks.append(eligible[ei][2])
-                ei += 1
-
-            if not pnls:
+            if not eligible:
+                stats = _stats([], tp, sl, threshold, hold, MCAP_MAX, date_range_days, dz_min, dz_max)
+                opt_rows.append(stats)
+                processed += 1
                 continue
 
-            # Only recompute stats if the trade set actually changed
-            if ei == last_emitted_ei:
-                continue
-            last_emitted_ei = ei
+            eligible.sort()
 
-            trades = [{"pnl": p, "peak": pk} for p, pk in zip(pnls, peaks)]
-            stats = _stats(trades, tp, sl, threshold, hold, max_mcap, date_range_days)
-            opt_rows.append(stats)
+            ei = 0
+            n_el = len(eligible)
+            pnls: list  = []
+            peaks: list = []
+            last_emitted_ei = -1
 
-            combo_score = _rank_score(stats)
-            if combo_score > best_score:
-                best_score = combo_score
-                best_combo = stats
+            buckets = set()
+            for mcap, _, _ in eligible:
+                buckets.add(((int(mcap) // MCAP_STEP) + 1) * MCAP_STEP)
+            buckets.add(MCAP_MAX)
+            mcap_thresholds = sorted(b for b in buckets if b <= MCAP_MAX)
 
-        if (combo_idx + 1) % 500 == 0:
-            log.info(f"  [{combo_idx+1}/{len(base_combos)}] combos swept, "
-                     f"best SQN so far: {best_score:.3f}")
+            for max_mcap in mcap_thresholds:
+                while ei < n_el and eligible[ei][0] <= max_mcap:
+                    pnls.append(eligible[ei][1])
+                    peaks.append(eligible[ei][2])
+                    ei += 1
+
+                if not pnls:
+                    continue
+                if ei == last_emitted_ei:
+                    continue
+                last_emitted_ei = ei
+
+                trades = [{"pnl": p, "peak": pk} for p, pk in zip(pnls, peaks)]
+                stats = _stats(trades, tp, sl, threshold, hold, max_mcap, date_range_days, dz_min, dz_max)
+                opt_rows.append(stats)
+
+                combo_score = _rank_score(stats)
+                if combo_score > best_score:
+                    best_score = combo_score
+                    best_combo = stats
+
+            processed += 1
+            if processed % 2000 == 0:
+                log.info(f"  [{processed}/{total_combos}] combos swept, best so far: {best_score:.3f}")
 
     _write_opt_results(opt_rows)
     _print_top10(opt_rows, best_combo)
+    # Dead zone is a structural filter — report findings but do NOT auto-update config.py.
+    # The 6-10% boundary has structural rationale that one half-year shouldn't override.
     return best_combo
 
 
@@ -362,7 +415,7 @@ def _rank_score(stats) -> float:
     return float(stats.get("avg_pnl_per_week", -999.0))
 
 
-def _stats(trades, tp, sl, threshold, hold, max_market_cap=None, date_range_days=None):
+def _stats(trades, tp, sl, threshold, hold, max_market_cap=None, date_range_days=None, dz_min=0.0, dz_max=0.0):
     """Calculate stats from trades list (dicts with pnl/peak keys)."""
     import statistics as _stats_mod
     n = len(trades)
@@ -373,7 +426,9 @@ def _stats(trades, tp, sl, threshold, hold, max_market_cap=None, date_range_days
             "trades_per_week": 0, "avg_pnl_per_week": 0,
             "tp_pct": round(tp * 100, 1), "sl_pct": round(sl * 100, 1),
             "score_threshold": threshold, "max_hold_days": hold,
-            "max_market_cap_m": round(max_market_cap / 1_000_000) if max_market_cap else None}
+            "max_market_cap_m": round(max_market_cap / 1_000_000) if max_market_cap else None,
+            "dz_min_pct": round(dz_min * 100, 1),
+            "dz_max_pct": round(dz_max * 100, 1)}
     if n == 0:
         return base
 
@@ -437,6 +492,29 @@ def _stats(trades, tp, sl, threshold, hold, max_market_cap=None, date_range_days
     return base
 
 
+def _update_config_dead_zone(best_combo):
+    """Update V2M_DEAD_ZONE_MIN/MAX in config.py based on optimizer best result."""
+    import re as _re
+    if best_combo is None:
+        return
+    dz_min = best_combo.get("dz_min_pct", 0) / 100
+    dz_max = best_combo.get("dz_max_pct", 0) / 100
+    config_path = os.path.join(os.path.dirname(__file__), "config.py")
+    try:
+        with open(config_path, "r") as f:
+            content = f.read()
+        content = _re.sub(r'V2M_DEAD_ZONE_MIN\s*=\s*[\d.]+', f'V2M_DEAD_ZONE_MIN = {dz_min}', content)
+        content = _re.sub(r'V2M_DEAD_ZONE_MAX\s*=\s*[\d.]+', f'V2M_DEAD_ZONE_MAX = {dz_max}', content)
+        with open(config_path, "w") as f:
+            f.write(content)
+        if dz_min < dz_max:
+            log.info(f"config.py updated: V2M dead zone {dz_min*100:.0f}%-{dz_max*100:.0f}%")
+        else:
+            log.info("config.py updated: V2M dead zone disabled")
+    except Exception as e:
+        log.warning(f"Could not update config.py dead zone: {e}")
+
+
 def _print_top10(opt_rows, best_combo):
     print("\n" + "=" * 135)
     print("  OPTIMIZER RESULTS — TOP 10 BY AVG PNL/WEEK (maximize weekly profit)")
@@ -463,6 +541,12 @@ def _print_top10(opt_rows, best_combo):
         print(f"      Stop Loss        : {best_combo['sl_pct']:.1f}%")
         print(f"      Hold Days        : {best_combo['max_hold_days']}")
         print(f"      Max Market Cap   : ${mcap}M" if mcap else "      Max Market Cap   : n/a")
+        dz_min = best_combo.get('dz_min_pct', 0)
+        dz_max = best_combo.get('dz_max_pct', 0)
+        if dz_min < dz_max:
+            print(f"      V2M Dead Zone    : {dz_min:.1f}% – {dz_max:.1f}%")
+        else:
+            print(f"      V2M Dead Zone    : disabled")
         print(f"      Trades           : {best_combo['trades']}")
         print(f"      Win Rate         : {best_combo['win_rate']}%")
         print(f"      Total Return     : {best_combo['total_pnl_pct']:+.2f}%")

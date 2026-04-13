@@ -34,6 +34,17 @@ MAX_AWARD_AMOUNT = 10_000_000_000  # $10B hard ceiling (skip M&O mega-contracts)
 MIN_VALUE_TO_MCAP_PCT = 0.01   # 1% minimum — filter only truly immaterial contracts
 MAX_VALUE_TO_MCAP_PCT = 5.00   # 500% maximum — filter zombie stocks (contract >> mcap)
 
+# V2M dead zone: 5-15% range has empirically low win rates (~38% vs 67%+ above/below).
+# Contracts in this range are material enough to notice but too small to be a catalyst.
+# Keep <5% (small-cap with outsized contract) and >=15% (material catalyst range).
+V2M_DEAD_ZONE_MIN = 0.06   # 6% — start of dead zone (5-6% has 100% WR, so allow it through)
+V2M_DEAD_ZONE_MAX = 0.10   # 10% — end of dead zone (6-10% has ~25% WR — the real dead zone)
+
+# V2M continuous scoring: sqrt curve, full 30pts at V2M >= this ratio.
+# Below this, score scales as sqrt(ratio / V2M_SCORE_FULL_CREDIT_RATIO) * 30.
+# Gives meaningful differentiation within the old flat 5-10% tier.
+V2M_SCORE_FULL_CREDIT_RATIO = 0.50   # 50% V2M = full 30 pts
+
 # Scoring weights (sum = 100)
 SCORE_WEIGHTS = {
     "value_to_mcap": 30,    # contract value as % of market cap
@@ -62,6 +73,11 @@ MAX_HOLD_DAYS = 3       # trading days before time exit
 
 # Ratchet (trailing stop) params — kept for backwards compat with old backtest runs
 GAP_PCT = 0.02          # 2% trailing gap — stop = entry + peak_gain - gap
+
+# Trailing stop on winners: once intraday high exceeds entry by ACTIVATE %, lock in
+# profits by trailing peak high by GAP %. Applied in simulate_asymmetric_from_row.
+TRAILING_STOP_ACTIVATE_PCT = 0.10  # 10% intraday peak to arm trailing stop (above TP entry zone)
+TRAILING_STOP_GAP_PCT = 0.02       # trail 2% below peak high once armed
 POSITION_SIZE = 200     # $ per trade
 
 # Backtest realism: slippage + commission
