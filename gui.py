@@ -587,12 +587,14 @@ def make_table(show_cols: list[str] | None = None) -> tuple[QTableView, CSVTable
 
 def _summary_stats(rows: list[dict]) -> dict:
     """Compute comprehensive summary stats from backtest result rows."""
+    import math
     if not rows:
         return {}
 
     pnls = []
     peak_pnls = []
     return_7ds = []
+    entry_dates = []
     tp_hits = sl_hits = timeouts = 0
 
     for r in rows:
@@ -612,10 +614,13 @@ def _summary_stats(rows: list[dict]) -> dict:
             pass
         try:
             ret_7d = float(r.get("return_t7", 0))
-            if ret_7d != 0:  # Only include if populated
+            if ret_7d != 0:
                 return_7ds.append(ret_7d)
         except (ValueError, TypeError):
             pass
+        d = r.get("entry_date") or r.get("award_date", "")
+        if d:
+            entry_dates.append(d[:10])
 
         if str(r.get("hit_tp", "")).lower() in ("true", "1", "yes"):
             tp_hits += 1
@@ -629,7 +634,6 @@ def _summary_stats(rows: list[dict]) -> dict:
 
     n = len(pnls)
     wins = sum(1 for p in pnls if p > 0)
-    losses = n - wins
 
     # Basic stats
     total_pnl = sum(pnls)
@@ -651,8 +655,34 @@ def _summary_stats(rows: list[dict]) -> dict:
     sum_losses = abs(sum(losing_trades))
     profit_factor = sum_wins / sum_losses if sum_losses > 0 else 0
 
-    # Expectancy
+    # Expectancy (mirrors optimizer formula)
     expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * abs(avg_loss))
+
+    # Std dev of PnL
+    if n > 1:
+        mean = avg_pnl
+        std_dev_pnl = math.sqrt(sum((p - mean) ** 2 for p in pnls) / (n - 1))
+    else:
+        std_dev_pnl = 0.0
+
+    # SQN (Van Tharp) — mirrors optimizer formula
+    sqn = (expectancy / std_dev_pnl) * math.sqrt(min(n, 100)) if std_dev_pnl > 0 else 0.0
+
+    # Trades per week — from date range of entry dates
+    trades_per_week = 0.0
+    avg_pnl_per_week = 0.0
+    if entry_dates:
+        try:
+            from datetime import date as _date
+            dates = sorted(_date.fromisoformat(d) for d in entry_dates if d)
+            if len(dates) >= 2:
+                weeks = max((dates[-1] - dates[0]).days / 7.0, 1.0)
+            else:
+                weeks = 1.0
+            trades_per_week = n / weeks
+            avg_pnl_per_week = avg_pnl * trades_per_week
+        except Exception:
+            pass
 
     # Max drawdown (cumulative approach)
     cumulative = 0
@@ -685,6 +715,10 @@ def _summary_stats(rows: list[dict]) -> dict:
         "avg_loss":            avg_loss,
         "profit_factor":       profit_factor,
         "expectancy":          expectancy,
+        "std_dev_pnl":         std_dev_pnl,
+        "sqn":                 sqn,
+        "trades_per_week":     trades_per_week,
+        "avg_pnl_per_week":    avg_pnl_per_week,
         "max_drawdown":        max_dd,
         "avg_peak_intraday":   avg_peak_intraday,
         "avg_7day_return":     avg_7day_return,
@@ -1273,29 +1307,45 @@ class BacktestTab(QWidget):
                 row3.addWidget(card)
             self._summary_lay.addLayout(row3)
 
-            # Row 4: Risk metrics
+            # Row 4: Optimizer-comparable metrics (same as Optimizer tab)
             row4 = QHBoxLayout()
             row4.setSpacing(6)
+            tpw = stats["trades_per_week"]
+            ppw = stats["avg_pnl_per_week"]
+            sqn = stats["sqn"]
+            for label, value, color in [
+                ("Trades / Week",   f"{tpw:.2f}",                            "#cdd6f4"),
+                ("Avg PnL / Week",  f"{ppw:+.2f}%",                          "#a6e3a1" if ppw >= 0 else "#f38ba8"),
+                ("SQN",             f"{sqn:.2f}" if sqn != 0 else "n/a",     "#f9e2af"),
+            ]:
+                card = _make_stat_card(label, value, color)
+                row4.addWidget(card)
+            row4.addStretch()
+            self._summary_lay.addLayout(row4)
+
+            # Row 5: Risk metrics
+            row5 = QHBoxLayout()
+            row5.setSpacing(6)
             for label, value, color in [
                 ("Profit Factor",   f"{stats['profit_factor']:.2f}x",       "#a6e3a1" if stats["profit_factor"] > 1 else "#f38ba8"),
                 ("Max Drawdown",    f"-{stats['max_drawdown']:.2f}%",        "#f38ba8"),
                 ("Expectancy",      f"{stats['expectancy']:+.2f}%",         "#a6e3a1" if stats["expectancy"] >= 0 else "#f38ba8"),
             ]:
                 card = _make_stat_card(label, value, color)
-                row4.addWidget(card)
-            self._summary_lay.addLayout(row4)
+                row5.addWidget(card)
+            self._summary_lay.addLayout(row5)
 
-            # Row 5: Extended returns
-            row5 = QHBoxLayout()
-            row5.setSpacing(6)
+            # Row 6: Extended returns
+            row6 = QHBoxLayout()
+            row6.setSpacing(6)
             for label, value, color in [
                 ("Peak Single Trade",   f"{stats['peak_single_trade']:+.2f}%", "#a6e3a1"),
                 ("Avg 7-Day Return",    f"{stats['avg_7day_return']:+.2f}%",   "#89b4fa"),
             ]:
                 card = _make_stat_card(label, value, color)
-                row5.addWidget(card)
-            row5.addStretch()
-            self._summary_lay.addLayout(row5)
+                row6.addWidget(card)
+            row6.addStretch()
+            self._summary_lay.addLayout(row6)
 
             self._trades_btn.setEnabled(True)
 
