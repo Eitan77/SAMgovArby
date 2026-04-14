@@ -1,0 +1,6 @@
+2026-04-10 11:51:38,356 INFO SEC: 10408 issuers loaded, 31224 aliases
+2026-04-10 11:51:40,542 INFO Nasdaq Trader: 6549 new symbols, 12502 aliases
+2026-04-10 11:51:41,978 INFO Acronym aliases: 7032 unique acronyms added
+BUILD OK in 4.6s: master=14585 common=6219 aliases=46014
+ADM aliases: [('ARCHER DANIELS MIDLAND',), ('ADM',), ('ARCHER DANIELS MIDLAND',), ('ARCHER COMMON DANIELS MIDLAND STOCK',), ('ADM',)]
+UTX: []

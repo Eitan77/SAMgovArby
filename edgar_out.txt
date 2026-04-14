@@ -1,0 +1,11 @@
+2026-04-10 15:47:43,191 INFO EDGAR former names: 6383 aliases added from 8036 CIKs
+Added 6383 former-name aliases in 13175s. Total aliases: 51513
+che/resolver.duckdb')
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\decla\Desktop\SAMgovArby\resolver\storage.py", line 201, in get_db
+    _connections[path] = duckdb.connect(path)
+                         ^^^^^^^^^^^^^^^^^^^^
+_duckdb.IOException: IO Error: Cannot open file "\\?\C:\Users\decla\Desktop\SAMgovArby\data\cache\resolver.duckdb": The process cannot access the file because it is being used by another process.
+
+File is already open in 
+C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\python3.12.exe (PID 42924)

@@ -27,7 +27,8 @@
       "Bash(python -c \":*)",
       "Bash(ls datasets/*.json)",
       "Bash(kill %1)",
-      "Bash(rtk read:*)"
+      "Bash(rtk read:*)",
+      "Bash(ls /c/Users/decla/Desktop/SAMgovArby/*.py)"
     ]
   }
 }
